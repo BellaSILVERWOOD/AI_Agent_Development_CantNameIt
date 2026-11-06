@@ -274,6 +274,8 @@ class OutboxPage(QWidget):
             parts.append(f"已发送 {counts['sent']}")
         if counts["failed"]:
             parts.append(f"失败 {counts['failed']}")
+        if counts.get("bounced"):
+            parts.append(f"已退信 {counts['bounced']}")
         self.subtitle.setText(" · ".join(parts) if counts["total"] else
                               "选择完成的任务与成果文件，一键发送汇报邮件")
         self.list_count.setText(f"{len(self._mails)} 封" if self._mails else "")
@@ -371,7 +373,12 @@ class OutboxPage(QWidget):
         layout.addLayout(header)
 
         error = str(mail.get("error", "")).strip()
-        if error and status == "failed":
+        if error and status == "bounced":
+            error_label = QLabel(f"退信原因：{error}")
+            error_label.setObjectName("Error")
+            error_label.setWordWrap(True)
+            layout.addWidget(error_label)
+        elif error and status == "failed":
             error_label = QLabel(f"发送失败：{error}")
             error_label.setObjectName("Error")
             error_label.setWordWrap(True)
@@ -407,7 +414,8 @@ class OutboxPage(QWidget):
         pieces = [f"致 {mail.get('to_addr', '') or '未填写收件人'}"]
         status = str(mail.get("status", "draft"))
         moment = mail.get("sent_at") or mail.get("created_at")
-        label = {"sent": "发送于", "failed": "发送失败于", "draft": "创建于"}.get(status, "")
+        label = {"sent": "发送于", "failed": "发送失败于", "draft": "创建于",
+                 "bounced": "被退信于"}.get(status, "")
         if moment:
             pieces.append(f"{label} {_format_time(moment)}")
         attachments = mail.get("attachments") or []

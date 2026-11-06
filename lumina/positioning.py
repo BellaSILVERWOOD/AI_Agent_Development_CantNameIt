@@ -26,6 +26,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import geo, location_win, wifi_scan
+from .utils import open_external
 
 MIN_MATCH = 2          # 至少命中 2 个 AP 才算认得出来
 MIN_SCORE = 0.42       # 归一化相似度阈值
@@ -228,6 +229,6 @@ def open_settings() -> None:
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
 
-        QDesktopServices.openUrl(QUrl(wifi_scan.LOCATION_SETTINGS_URI))
+        open_external(wifi_scan.LOCATION_SETTINGS_URI)
     except Exception:
         pass

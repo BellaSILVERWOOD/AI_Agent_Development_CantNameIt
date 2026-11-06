@@ -55,6 +55,54 @@ def _inline(label_text: str, widget: QWidget, width: int = 68, top: bool = False
 
 
 # ---------------------------------------------------------------------- 日程编辑
+REPEAT_LABELS = {"daily": "每天", "weekly": "每周", "monthly": "每月",
+                "yearly": "每年"}
+
+
+class SeriesDeleteDialog(BaseDialog):
+    """删除重复日程：只删这一次 / 删除这次及以后 / 删除全部。"""
+
+    def __init__(self, parent, event: Dict[str, Any]):
+        title = str((event or {}).get("title") or "日程")
+        rule = REPEAT_LABELS.get(str((event or {}).get("repeat") or ""), "重复")
+        day = str((event or {}).get("date") or "")[:10]
+        super().__init__(
+            parent,
+            width=560,
+            height=236,
+            title="删除重复日程",
+            subtitle="这是一个「%s」的日程" % rule,
+            icon=icons.CALENDAR,
+            icon_color=QColor(DANGER).name(),
+        )
+        self.choice = ""
+        message = QLabel(
+            "「%s」（%s，%s）是重复日程，删掉以后不会再出现在日历里。要删哪一部分？"
+            % (title, rule, day))
+        message.setWordWrap(True)
+        message.setObjectName("Muted")
+        self.body.addWidget(message)
+        hint = QLabel("「只删这一次」会把它记成例外；「删除这次及以后」会把重复结束在这一天之前。")
+        hint.setWordWrap(True)
+        hint.setObjectName("Tiny")
+        self.body.addWidget(hint)
+        self.one_button = SoftButton("只删这一次", "ghost", height=36, min_width=112)
+        self.future_button = SoftButton("删除这次及以后", "ghost", height=36,
+                                        min_width=132)
+        self.all_button = SoftButton("删除全部", "danger", height=36, min_width=104)
+        self.cancel_button = SoftButton("取消", "ghost", height=36, min_width=84)
+        self.one_button.clicked.connect(lambda: self._pick("one"))
+        self.future_button.clicked.connect(lambda: self._pick("future"))
+        self.all_button.clicked.connect(lambda: self._pick("all"))
+        self.cancel_button.clicked.connect(self.reject)
+        self.add_footer([self.cancel_button],
+                        [self.one_button, self.future_button, self.all_button])
+
+    def _pick(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()
+
+
 class EventDialog(BaseDialog):
     saved = Signal(int)
     deleted = Signal(int)
@@ -64,12 +112,24 @@ class EventDialog(BaseDialog):
         self.store = store
         self.event_data = event  # 注意：不能命名为 event，会覆盖 QObject.event()
         self.editing = event is not None
+        # 点开的是「重复日程的某一次」：编辑的是整串，不是把这一天的日期写成新的起点
+        self._occurrence_date = str((event or {}).get("date") or "")[:10]
+        self._series_master = None
+        if event and event.get("repeat_of"):
+            try:
+                self._series_master = store.get_event(int(event["repeat_of"]))
+            except Exception:
+                self._series_master = None
+        subtitle = ("修改后提醒时间会自动重新计算" if self.editing
+                    else "设置时间与提醒，让计划准时发生")
+        if self._series_master is not None:
+            subtitle = "这是重复日程的一次；这里的修改会作用到整串（日期是起始日）"
         super().__init__(
             parent,
             width=600,
-            height=480,
+            height=540,
             title="编辑日程" if self.editing else "新建日程",
-            subtitle="修改后提醒时间会自动重新计算" if self.editing else "设置时间与提醒，让计划准时发生",
+            subtitle=subtitle,
             icon=icons.CALENDAR,
         )
 
@@ -107,6 +167,24 @@ class EventDialog(BaseDialog):
         extras.addWidget(FieldBlock("分组", self.group_select), 2)
         extras.addWidget(FieldBlock("颜色", self.color_dots), 2)
         body.addLayout(extras)
+
+        # 重复：每年 / 每月 / 每周 / 每天（也可以不重复）
+        self.repeat_combo = Select()
+        self.repeat_combo.addItem("不重复", "")
+        self.repeat_combo.addItem("每天", "daily")
+        self.repeat_combo.addItem("每周（同一天）", "weekly")
+        self.repeat_combo.addItem("每月（同一日）", "monthly")
+        self.repeat_combo.addItem("每年（同月同日）", "yearly")
+        self.repeat_combo.setToolTip(
+            "选了之后，这个日程会按规则重复出现在日历里；"
+            "月底的日程（比如 31 号）在没有这一天的月份会跳过")
+        repeat_hint = QLabel("重复的日程只存一条，日历里按规则显出来")
+        repeat_hint.setObjectName("Tiny")
+        repeat_row = QHBoxLayout()
+        repeat_row.setSpacing(10)
+        repeat_row.addWidget(FieldBlock("重复", self.repeat_combo), 3)
+        repeat_row.addWidget(repeat_hint, 4)
+        body.addLayout(repeat_row)
         self._reload_groups()
 
         self.desc_edit = QTextEdit()
@@ -136,7 +214,7 @@ class EventDialog(BaseDialog):
         self.add_footer(left_widgets, [self.cancel_button, self.save_button])
 
         if self.editing:
-            self._populate(event)
+            self._populate(self._series_master or event)
         else:
             self._default_times(QDate(date) if date else QDate.currentDate())
 
@@ -176,6 +254,9 @@ class EventDialog(BaseDialog):
             if self.remind_combo.itemData(index) == minutes:
                 self.remind_combo.setCurrentIndex(index)
                 break
+        repeat = str(event.get("repeat") or "")
+        repeat_index = self.repeat_combo.findData(repeat)
+        self.repeat_combo.setCurrentIndex(max(0, repeat_index))
 
     # -------------------------------------------------- 交互
     def _set_error(self, message: str) -> None:
@@ -246,6 +327,7 @@ class EventDialog(BaseDialog):
                     remind_minutes=self.remind_combo.currentData(),
                     color=self.color_dots.color(),
                     group_id=self._current_group_id(),
+                    repeat=self.repeat_combo.currentData() or "",
                 )
             else:
                 event_id = self.store.add_event(
@@ -257,6 +339,7 @@ class EventDialog(BaseDialog):
                     remind_minutes=self.remind_combo.currentData(),
                     color=self.color_dots.color(),
                     group_id=self._current_group_id(),
+                    repeat=self.repeat_combo.currentData() or "",
                 )
         except Exception as exc:
             self._set_error(f"保存失败：{exc}")
@@ -266,6 +349,26 @@ class EventDialog(BaseDialog):
 
     def _delete(self) -> None:
         if not self.editing:
+            return
+        source = self._series_master or self.event_data
+        repeat = str(source.get("repeat") or "")
+        if repeat:
+            master_id = int(source.get("id")
+                            or self.event_data.get("repeat_of") or 0)
+            day = str(self._occurrence_date
+                      or self.event_data.get("date") or "")[:10]
+            dialog = SeriesDeleteDialog(
+                self, {**source, "date": day or source.get("date", "")})
+            if not dialog.exec() or not dialog.choice:
+                return
+            if dialog.choice == "one":
+                self.store.skip_occurrence(master_id, day)
+            elif dialog.choice == "future":
+                self.store.end_repeat_before(master_id, day)
+            else:
+                self.store.delete_event(master_id)
+            self.deleted.emit(master_id)
+            self.accept()
             return
         dialog = ConfirmDialog(
             self,

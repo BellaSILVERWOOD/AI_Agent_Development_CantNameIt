@@ -7,28 +7,30 @@ from pathlib import Path
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QIntValidator, QLinearGradient, QPainter, QPen,
 )
 from PySide6.QtWidgets import (
     QCheckBox, QPlainTextEdit,
     QApplication, QColorDialog, QFileDialog, QGridLayout, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QSlider, QVBoxLayout, QWidget,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QSlider,
+    QVBoxLayout, QWidget,
 )
 
 from . import accounts, fdu, icons, theme, timetable
+from .utils import open_external
 from .config import APP_VERSION, DATA_DIR, SMTP_SECURITY
 from .mailer import SmtpConfig
 from .sending import SmtpTester
 from .theme import (
-    ACCENT, ACCENT2, BORDER, CARD, DANGER, FAINT, MUTED, SUCCESS, TEXT, TEXT_SOFT,
-    WARNING,
+    ACCENT, ACCENT2, BORDER, BORDER_SOFT, CARD, CARD_ALT, CARD_HOVER, DANGER,
+    FAINT, MUTED, SUCCESS, TEXT, TEXT_SOFT, WARNING,
 )
 from .inputs import ColorDots
 from .widgets import (
-    Card, FieldBlock, GlassSlider, IconBadge, IconButton, Select, SoftButton,
-    ToggleSwitch, clear_layout, rounded_path,
+    Card, FieldBlock, GlassSlider, HScrollRow, IconBadge, IconButton, NavButton,
+    Select, SoftButton, ToggleSwitch, clear_layout, rounded_path,
 )
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -37,8 +39,10 @@ EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 LLM_PRESETS: List[Dict[str, str]] = [
     {"id": "local", "name": "本地模型",
      "base": "http://127.0.0.1:8080/v1", "model": ""},
-    {"id": "deepseek", "name": "DeepSeek（官方 API）",
+    {"id": "deepseek", "name": "DeepSeek 对话（deepseek-chat）",
      "base": "https://api.deepseek.com/v1", "model": "deepseek-chat"},
+    {"id": "deepseek-r1", "name": "DeepSeek R1（会「思考」）",
+     "base": "https://api.deepseek.com/v1", "model": "deepseek-reasoner"},
     {"id": "doubao", "name": "豆包（火山方舟）",
      "base": "https://ark.cn-beijing.volces.com/api/v3", "model": ""},
     {"id": "kimi", "name": "Kimi（月之暗面）",
@@ -397,6 +401,11 @@ class SettingsPage(QWidget):
         self._accounts: List[Dict[str, Any]] = accounts.load(store)
         self._active_account = accounts.active_id(store)
         self._loading_account = False
+        # 外观实时预览：点选类的立刻应用，滑杆这类连续变化走这个定时器节流
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(120)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._preview_appearance)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 18, 26, 20)
@@ -421,30 +430,317 @@ class SettingsPage(QWidget):
 
         from .widgets import make_scroll
 
+        # -------------------------------------------------- 左右两栏
+        # 左边是分类导航（常规 / 邮件 / 日程 / AI / 其他），右边只显示当前分类，
+        # 顶部有一个大标题 + 一句说明 —— 跟现代设置页一个样子。
+        self._sections = [
+            {"key": "general", "title": "常规", "glyph": icons.SUN,
+             "subtitle": "外观、账户、提醒与界面交互",
+             "cards": ["appearance", "tray", "account", "reminder", "focus", "uis"]},
+            {"key": "dashboard", "title": "仪表板", "glyph": icons.INFO,
+             "subtitle": "校车方向与 ehall 各服务的数据来源",
+             "cards": ["dashsrc"]},
+            {"key": "mail", "title": "邮件", "glyph": icons.MAIL,
+             "subtitle": "发件邮箱、收件箱、联系人与教务通知",
+             "cards": ["smtp", "imap", "recipient", "notice", "dirs"]},
+            {"key": "schedule", "title": "日程", "glyph": icons.CALENDAR,
+             "subtitle": "课程表、日程分组与出发提醒",
+             "cards": ["timetable", "groups", "location"]},
+            {"key": "ai", "title": "AI", "glyph": icons.INFO,
+             "subtitle": "模型接口、多套 API 配置与提示词",
+             "cards": ["llm", "prompts"]},
+            {"key": "misc", "title": "其他", "glyph": icons.FOLDER,
+             "subtitle": "网络代理、文献与本地数据",
+             "cards": ["vpn", "refs", "data"]},
+        ]
+        self._current_section = "general"
+
+        body_row = QHBoxLayout()
+        body_row.setSpacing(14)
+
+        nav_panel = QWidget()
+        nav_panel.setFixedWidth(190)
+        nav_layout = QVBoxLayout(nav_panel)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(4)
+        # 「返回应用」：跟参考图一样放在最上面，点了回日历
+        self.back_button = NavButton(icons.CHEVRON_LEFT, "返回应用")
+        self.back_button.clicked.connect(self._back_to_app)
+        nav_layout.addWidget(self.back_button)
+        nav_layout.addSpacing(4)
+        self.nav_search = QLineEdit()
+        self.nav_search.setPlaceholderText("搜索设置（比如 vpn、字体、key）")
+        self.nav_search.setFixedHeight(34)
+        self.nav_search.setToolTip(
+            "搜的是**设置项本身**：卡片标题、字段名、说明文字都能搜到\n"
+            "点结果会跳到对应分类并滚到那张卡片")
+        self.nav_search.textChanged.connect(lambda _text: self._filter_nav())
+        nav_layout.addWidget(self.nav_search)
+        # 搜索结果（平时藏着；有搜索词时列出来，点一下跳过去）
+        self.search_results = QListWidget()
+        self.search_results.setObjectName("SearchResults")
+        self.search_results.setVisible(False)
+        self.search_results.setMaximumWidth(190)     # 别盖到右边的设置内容上
+        self.search_results.itemClicked.connect(self._on_search_pick)
+        self.search_results.setStyleSheet(
+            f"QListWidget#SearchResults {{ background: {CARD};"
+            f" border: 1px solid {BORDER}; border-radius: 10px;"
+            f" padding: 4px; outline: none; }}"
+            f"QListWidget#SearchResults::item {{ padding: 6px 8px;"
+            f" border-radius: 6px; color: {TEXT}; }}"
+            f"QListWidget#SearchResults::item:hover {{ background: {CARD_HOVER}; }}"
+            f"QListWidget#SearchResults::item:selected {{"
+            f" background: {ACCENT}; color: #FFFFFF; }}")
+        nav_layout.addWidget(self.search_results)
+        self._search_layout = nav_layout
+        nav_layout.addSpacing(6)
+        self._nav_buttons: Dict[str, NavButton] = {}
+        for section in self._sections:
+            button = NavButton(section["glyph"], section["title"])
+            button.clicked.connect(
+                lambda _=False, key=section["key"]: self._select_section(key))
+            self._nav_buttons[section["key"]] = button
+            nav_layout.addWidget(button)
+        nav_layout.addStretch(1)
+        body_row.addWidget(nav_panel)
+
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        self.page_title = QLabel("常规")
+        self.page_title.setObjectName("H1")
+        self.page_subtitle = QLabel("")
+        self.page_subtitle.setObjectName("Muted")
+        right.addWidget(self.page_title)
+        right.addWidget(self.page_subtitle)
         self.settings_scroll, _body, self.content = make_scroll()
         self.content.setSpacing(14)
-        root.addWidget(self.settings_scroll, 1)
+        right.addWidget(self.settings_scroll, 1)
+        body_row.addLayout(right, 1)
+        root.addLayout(body_row, 1)
 
-        self.content.addWidget(self._build_appearance_card())
-        self.content.addWidget(self._build_smtp_card())
-        self.content.addWidget(self._build_imap_card())
-        self.content.addWidget(self._build_uis_card())
-        self.content.addWidget(self._build_timetable_card())
-        self.content.addWidget(self._build_groups_card())
-        self.content.addWidget(self._build_recipient_card())
-        self.content.addWidget(self._build_dirs_card())
-        self.content.addWidget(self._build_notice_card())
-        self.content.addWidget(self._build_location_card())
-        self.content.addWidget(self._build_reminder_card())
-        self.content.addWidget(self._build_focus_card())
-        self.content.addWidget(self._build_llm_card())
-        self.content.addWidget(self._build_prompts_card())
-        self.content.addWidget(self._build_vpn_card())
-        self.content.addWidget(self._build_refs_card())
-        self.content.addWidget(self._build_data_card())
+        # -------------------------------------------------- 所有卡片（建一次，按分类显隐）
+        self._card_widgets: Dict[str, QWidget] = {
+            "appearance": self._build_appearance_card(),
+            "dashsrc": self._build_dashsrc_card(),
+            "account": self._build_account_card(),
+            "smtp": self._build_smtp_card(),
+            "imap": self._build_imap_card(),
+            "uis": self._build_uis_card(),
+            "timetable": self._build_timetable_card(),
+            "groups": self._build_groups_card(),
+            "recipient": self._build_recipient_card(),
+            "dirs": self._build_dirs_card(),
+            "notice": self._build_notice_card(),
+            "location": self._build_location_card(),
+            "reminder": self._build_reminder_card(),
+            "focus": self._build_focus_card(),
+            "llm": self._build_llm_card(),
+            "prompts": self._build_prompts_card(),
+            "vpn": self._build_vpn_card(),
+            "refs": self._build_refs_card(),
+            "tray": self._build_tray_card(),
+            "data": self._build_data_card(),
+        }
+        for widget in self._card_widgets.values():
+            self.content.addWidget(widget)
         self.content.addStretch(1)
+        self._build_search_index()
+        self._select_section("general")
 
         self.refresh()
+        # 到这里控件都建好、值也回填完了，之后的改动才算「用户真的在改」
+        self._preview_ready = True
+
+    # -------------------------------------------------- 分类导航
+    def _back_to_app(self) -> None:
+        """回到主界面（日历）。"""
+        window = self.window()
+        navigate = getattr(window, "navigate", None)
+        if callable(navigate):
+            navigate(0)
+
+    def _select_section(self, key: str) -> None:
+        """切换左边分类：只显示属于它的卡片。"""
+        section = next((item for item in self._sections if item["key"] == key),
+                       self._sections[0])
+        self._current_section = section["key"]
+        for name, button in self._nav_buttons.items():
+            try:
+                button.set_active(name == section["key"])
+            except Exception:
+                pass
+        shown = set(section["cards"])
+        for name, widget in getattr(self, "_card_widgets", {}).items():
+            try:
+                widget.setVisible(name in shown)
+            except Exception:
+                pass
+        self.page_title.setText(section["title"])
+        self.page_subtitle.setText(section.get("subtitle") or "")
+        if section["key"] == "dashboard":
+            # 地址可能在别处被改过（比如「空教室」页的「设为首页」），进来时重读一次
+            self._refresh_dashsrc_edits()
+        try:
+            self.settings_scroll.verticalScrollBar().setValue(0)
+        except Exception:
+            pass
+
+    def section(self) -> str:
+        """当前显示的分类（测试 / 外部跳转用）。"""
+        return getattr(self, "_current_section", "general")
+
+    def show_section(self, key: str) -> None:
+        """外部跳转：例如从 AI 面板跳到「AI」分类。"""
+        if any(item["key"] == key for item in getattr(self, "_sections", [])):
+            self._select_section(key)
+
+    def _filter_nav(self) -> None:
+        """搜索框：按文字过滤左边的分类项，**并且列出匹配的设置卡片**。
+
+        以前只拿「分类标题 + 副标题」去匹配，所以搜 vpn / 字体 / Key 什么都看不到，
+        看着像假的。现在按卡片（标题、字段名、说明、提示）建了索引，能直接搜到项。
+        """
+        text = ""
+        try:
+            text = self.nav_search.text().strip()
+        except Exception:
+            text = ""
+        lowered = text.lower()
+        matches = self.search_matches(text)
+        # 分类：只要里面有匹配的卡片就留下
+        keep_sections = {item["section"] for item in matches}
+        for section in getattr(self, "_sections", []):
+            button = self._nav_buttons.get(section["key"])
+            if button is None:
+                continue
+            try:
+                if not text or not matches:
+                    # 没搜索词 / 一个都没搜到：分类照常全显示，别让人以为页面空了
+                    button.setVisible(True)
+                else:
+                    button.setVisible(section["key"] in keep_sections)
+            except Exception:
+                pass
+        self._show_search_results(text, matches)
+
+    # -------------------------------------------------- 搜索
+    #: 常见英文 / 缩写 → 中文（搜 proxy 也能找到「代理」，反之亦然）
+    SEARCH_SYNONYMS = {
+        "vpn": "代理 vpn", "proxy": "代理", "key": "密钥 key api",
+        "api": "接口 api key 模型", "token": "token 用量", "mail": "邮件 邮箱",
+        "smtp": "发件 smtp", "imap": "收件 imap", "font": "字体",
+        "theme": "外观 主题", "dark": "深色 深色模式", "light": "浅色",
+        "blur": "模糊 磨砂", "tray": "托盘", "traffic": "校车 班车",
+        "password": "密码", "font size": "字号", "ai": "ai 接口 模型",
+    }
+
+    def _build_search_index(self) -> None:
+        """给每张设置卡片建一条索引（标题 + 所有文字 + 占位提示 + 按钮）。"""
+        self._search_index: List[Dict[str, Any]] = []
+        for section in getattr(self, "_sections", []):
+            for name in section.get("cards") or []:
+                widget = (getattr(self, "_card_widgets", {}) or {}).get(name)
+                if widget is None:
+                    continue
+                title, haystack = self._describe_card(widget)
+                entry = {
+                    "card": name,
+                    "section": section["key"],
+                    "section_title": section["title"],
+                    "title": title or name,
+                    "widget": widget,
+                    "text": haystack.lower(),
+                }
+                self._search_index.append(entry)
+
+    @staticmethod
+    def _describe_card(widget) -> "tuple[str, str]":
+        """一张卡片：取它的标题（优先 H3）和所有能搜的文字。"""
+        pieces: List[str] = []
+        title = ""
+        for label in widget.findChildren(QLabel):
+            text = str(label.text() or "").strip()
+            if not text:
+                continue
+            if not title and label.objectName() in ("H3", "H2", "H4"):
+                title = text
+            pieces.append(text)
+        for edit in widget.findChildren(QLineEdit):
+            pieces.append(str(edit.placeholderText() or ""))
+            pieces.append(str(edit.toolTip() or ""))
+        for button in widget.findChildren(QWidget):
+            tip = str(button.toolTip() or "")
+            if tip:
+                pieces.append(tip)
+        return title, "\n".join(pieces)
+
+    def search_matches(self, text: str) -> List[Dict[str, Any]]:
+        """按关键词找设置卡片（空的搜索词返回空列表）。"""
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return []
+        words = [word for word in re.split(r"\s+", lowered) if word]
+        extras = [word for word in self.SEARCH_SYNONYMS.get(lowered, "").split()
+                  if word]
+        results: List[Dict[str, Any]] = []
+        for entry in getattr(self, "_search_index", []):
+            haystack = entry["text"]
+            hit = all(word in haystack for word in words)
+            if not hit and len(words) == 1:
+                # 同义词：搜 proxy 也认「代理」，搜 key 也认「密钥」
+                hit = any(word in haystack for word in extras)
+            if hit:
+                results.append(entry)
+        # 「标题里就有这个词」的排前面
+        results.sort(key=lambda row: (lowered not in str(row["title"]).lower(),
+                                      len(str(row["title"]))))
+        return results
+
+    def _show_search_results(self, text: str,
+                             matches: List[Dict[str, Any]]) -> None:
+        """把匹配结果显示在搜索框下面（点一下跳过去）。"""
+        box = getattr(self, "search_results", None)
+        if box is None:
+            return
+        box.clear()
+        if not text:
+            box.setVisible(False)
+            return
+        if not matches:
+            item = QListWidgetItem("没找到相关设置")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            box.addItem(item)
+            box.setFixedHeight(38)
+            box.setVisible(True)
+            return
+        for entry in matches[:16]:
+            item = QListWidgetItem("%s　·　%s" % (entry["title"],
+                                                 entry["section_title"]))
+            item.setData(Qt.ItemDataRole.UserRole, entry["card"])
+            item.setToolTip("在「%s」分类里：%s" % (entry["section_title"],
+                                                 entry["title"]))
+            box.addItem(item)
+        rows = min(len(matches), 8)
+        box.setFixedHeight(rows * 30 + 10)
+        box.setVisible(True)
+
+    def _on_search_pick(self, item: "QListWidgetItem") -> None:
+        """点了搜到的设置：切到那个分类、滚到那张卡片。"""
+        card = item.data(Qt.ItemDataRole.UserRole)
+        entry = next((row for row in self._search_index
+                      if row["card"] == card), None)
+        if entry is None:
+            return
+        self._select_section(entry["section"])
+        self.page_subtitle.setText("已定位到「%s」" % entry["title"])
+        target = entry["widget"]
+        QTimer.singleShot(60, lambda: self._scroll_to_card(target))
+
+    def _scroll_to_card(self, widget) -> None:
+        try:
+            self.settings_scroll.ensureWidgetVisible(widget, 0, 20)
+        except Exception:
+            pass
 
     # -------------------------------------------------- 卡片
     @staticmethod
@@ -466,13 +762,263 @@ class SettingsPage(QWidget):
         row.addLayout(text_box, 1)
         return row
 
+    # -------------------------------------------------- 账户与登录
+    def _build_account_card(self) -> Card:
+        card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=12)
+        card.body.addLayout(self._section_head(
+            icons.CONTACT, "账户与登录",
+            "账户只存在这台电脑；密码保存的是加盐哈希（PBKDF2），任何界面都看不到原文",
+        ))
+
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+        self.account_label = QLabel("—")
+        self.account_label.setStyleSheet(
+            f"color: {TEXT}; font-size: 10pt; font-weight: 600;")
+        self.account_hint = QLabel("")
+        self.account_hint.setObjectName("Tiny")
+        self.account_hint.setWordWrap(True)
+        text_box.addWidget(self.account_label)
+        text_box.addWidget(self.account_hint)
+        row.addLayout(text_box, 1)
+        self.logout_button = SoftButton("在这台设备上退出登录", "ghost", height=32,
+                                        min_width=168, point_size=8.6)
+        self.logout_button.setToolTip("清除「记住这台设备」，下次打开应用要重新输密码")
+        self.logout_button.clicked.connect(self._logout_device)
+        row.addWidget(self.logout_button)
+        self.admin_button = SoftButton("账户审核（管理员）", "ghost", height=32,
+                                       min_width=150, point_size=8.6)
+        self.admin_button.setToolTip("批准注册申请、管理注册表、导出管理员公钥")
+        self.admin_button.clicked.connect(self._open_admin_dialog)
+        row.addWidget(self.admin_button)
+        card.body.addLayout(row)
+
+        remember_row = QHBoxLayout()
+        remember_row.setSpacing(8)
+        remember_label = QLabel("记住这台设备")
+        remember_label.setObjectName("Tiny")
+        remember_row.addWidget(remember_label)
+        from . import users
+
+        self.remember_select = Select()
+        self.remember_select.setFixedWidth(216)
+        for minutes, label in users.REMEMBER_CHOICES:
+            self.remember_select.addItem(label, minutes)
+        self.remember_select.currentIndexChanged.connect(self._on_remember_changed)
+        remember_row.addWidget(self.remember_select)
+        self.bind_button = SoftButton("绑定这台设备（以后不用输密码）", "ghost",
+                                      height=32, min_width=216, point_size=8.6)
+        self.bind_button.setToolTip("只有管理员能这么做：把这台电脑记为可信设备，"
+                                    "以后打开应用不再定时要求输密码")
+        self.bind_button.clicked.connect(self._bind_device)
+        remember_row.addWidget(self.bind_button)
+        self.remember_hint = QLabel("到期后打开应用要重新输一次密码")
+        self.remember_hint.setObjectName("Tiny")
+        remember_row.addWidget(self.remember_hint)
+        remember_row.addStretch(1)
+        card.body.addLayout(remember_row)
+
+        # 改密码
+        pw_title = QLabel("修改密码")
+        pw_title.setObjectName("Tiny")
+        card.body.addWidget(pw_title)
+        # 分栏变窄时这一排放不下 → 横向滚动
+        pw_row = HScrollRow(height=40, spacing=8)
+        self.old_password = QLineEdit()
+        self.old_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.old_password.setPlaceholderText("原密码")
+        self.old_password.setFixedWidth(170)
+        pw_row.addWidget(self.old_password)
+        self.new_password = QLineEdit()
+        self.new_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.new_password.setPlaceholderText("新密码（至少 6 位）")
+        self.new_password.setFixedWidth(190)
+        pw_row.addWidget(self.new_password)
+        self.new_password2 = QLineEdit()
+        self.new_password2.setEchoMode(QLineEdit.EchoMode.Password)
+        self.new_password2.setPlaceholderText("再输一次新密码")
+        self.new_password2.setFixedWidth(170)
+        pw_row.addWidget(self.new_password2)
+        self.change_password_button = SoftButton("保存新密码", "primary", height=32,
+                                                 min_width=110, point_size=8.6)
+        self.change_password_button.clicked.connect(self._change_password)
+        pw_row.addWidget(self.change_password_button)
+        card.body.addWidget(pw_row)
+
+        self.account_status = QLabel("")
+        self.account_status.setObjectName("Tiny")
+        self.account_status.setWordWrap(True)
+        card.body.addWidget(self.account_status)
+        return card
+
+    def _current_user(self):
+        from . import users
+
+        window = self.window()
+        user = getattr(window, "current_user", None)
+        if user:
+            return user
+        return users.current_session(self.store)
+
+    def _refresh_account_card(self) -> None:
+        from . import users
+
+        if not hasattr(self, "account_label"):
+            return
+        user = self._current_user()
+        if user:
+            role = "管理员" if users.is_admin(user) else "普通用户"
+            self.account_label.setText(
+                f"当前账户：{user.get('username', '')}（{role}）")
+            try:
+                self.admin_button.setVisible(bool(users.is_admin(user)))
+            except Exception:
+                pass
+        else:
+            self.account_label.setText("当前账户：—")
+            try:
+                self.admin_button.setVisible(False)
+            except Exception:
+                pass
+        session = users.current_session(self.store)
+        validity = users.validity_state(user) if user else ""
+        trusted = bool(session and session.get("trusted"))
+        if session:
+            self.account_hint.setText(f"{validity} · {users.session_text(self.store)}")
+        elif users.login_required(self.store):
+            self.account_hint.setText(
+                f"{validity} · 这台设备没有记住登录，下次打开应用要输密码")
+        else:
+            self.account_hint.setText(f"{validity} · 登录已关闭（不需要密码）")
+        # 记住时长：管理员多一个「永久绑定这台设备」
+        choices = list(users.REMEMBER_CHOICES)
+        if users.is_admin(user):
+            choices.append(users.REMEMBER_ADMIN_CHOICE)
+        minutes = users.remember_minutes(self.store)
+        self.remember_select.blockSignals(True)
+        self.remember_select.clear()
+        for value, label in choices:
+            self.remember_select.addItem(label, value)
+        index = self.remember_select.findData(minutes)
+        self.remember_select.setCurrentIndex(max(0, index))
+        self.remember_select.blockSignals(False)
+        try:
+            admin = bool(users.is_admin(user))
+            self.bind_button.setVisible(admin)
+            self.bind_button.setEnabled(admin and not trusted)
+            self.bind_button.setText(
+                "已永久绑定这台设备" if trusted else "绑定这台设备（以后不用输密码）")
+        except Exception:
+            pass
+
+    def _on_remember_changed(self) -> None:
+        from . import users
+
+        minutes = int(self.remember_select.currentData() or 0)
+        users.set_remember_minutes(self.store, minutes)
+        user = self._current_user()
+        try:
+            if minutes <= 0:
+                users.forget_device(self.store)
+            elif user:
+                users.remember_device(self.store, int(user["id"]), minutes)
+        except users.AccountError as exc:
+            self.account_status.setStyleSheet(f"color: {DANGER};")
+            self.account_status.setText(str(exc))
+            self._refresh_account_card()
+            return
+        self._refresh_account_card()
+        self.account_status.setStyleSheet(f"color: {SUCCESS};")
+        self.account_status.setText(
+            "已永久绑定这台设备，以后不用再输密码"
+            if minutes < 0 else
+            ("已记住这台设备" if minutes > 0 else "已改成每次都要输密码"))
+
+    def _bind_device(self) -> None:
+        """管理员把当前这台设备记成可信设备：不再定时要求输密码。"""
+        from . import users
+
+        user = self._current_user()
+        if not users.is_admin(user):
+            self.account_status.setStyleSheet(f"color: {DANGER};")
+            self.account_status.setText("只有管理员账户可以绑定设备")
+            return
+        try:
+            users.set_remember_minutes(self.store, users.REMEMBER_FOREVER)
+            users.remember_device(self.store, int(user["id"]),
+                                  users.REMEMBER_FOREVER)
+        except users.AccountError as exc:
+            self.account_status.setStyleSheet(f"color: {DANGER};")
+            self.account_status.setText(str(exc))
+            return
+        self._refresh_account_card()
+        self.account_status.setStyleSheet(f"color: {SUCCESS};")
+        self.account_status.setText(
+            f"已把这台设备绑定到管理员「{user.get('username', '')}」："
+            "以后打开应用不用再输密码（换设备或点「在这台设备上退出登录」才需要）")
+
+    def _change_password(self) -> None:
+        from . import users
+
+        user = self._current_user()
+        if not user:
+            self.account_status.setStyleSheet(f"color: {DANGER};")
+            self.account_status.setText("没有登录账户，改不了密码")
+            return
+        if self.new_password.text() != self.new_password2.text():
+            self.account_status.setStyleSheet(f"color: {DANGER};")
+            self.account_status.setText("两次输入的新密码不一样")
+            return
+        try:
+            users.change_password(self.store, int(user["id"]),
+                                  self.old_password.text(), self.new_password.text())
+        except users.AccountError as exc:
+            self.account_status.setStyleSheet(f"color: {DANGER};")
+            self.account_status.setText(str(exc))
+            return
+        self.old_password.clear()
+        self.new_password.clear()
+        self.new_password2.clear()
+        self.account_status.setStyleSheet(f"color: {SUCCESS};")
+        self.account_status.setText("密码已更新（下次登录用新密码）")
+
+    def _logout_device(self) -> None:
+        from . import users
+
+        users.forget_device(self.store)
+        self._refresh_account_card()
+        self.account_status.setStyleSheet(f"color: {MUTED};")
+        self.account_status.setText("已退出登录：下次打开应用要重新输密码")
+
+    def _open_admin_dialog(self) -> None:
+        from . import users
+
+        user = self._current_user()
+        if not users.is_admin(user):
+            self.account_status.setStyleSheet(f"color: {DANGER};")
+            self.account_status.setText("只有管理员能审批注册申请")
+            return
+        from .admin_dialog import AdminDialog
+
+        dialog = AdminDialog(self.store, self.window())
+        dialog.exec()
+        self._refresh_account_card()
+
     # -------------------------------------------------- 外观
     def _build_appearance_card(self) -> Card:
         card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=14)
         card.body.addLayout(self._section_head(
             icons.EYE, "外观",
-            "浅色 / 深色、强调色与窗口通透度，保存设置后立即生效",
+            "浅色 / 深色、强调色与窗口通透度 —— 改一下这里立刻就变，并且自动保存",
         ))
+        live_hint = QLabel("改这里的所有东西都会马上生效（不用点右上角「保存设置」），"
+                           "也会立刻写进设置，下次打开还是这个样子。")
+        live_hint.setObjectName("Tiny")
+        live_hint.setWordWrap(True)
+        live_hint.setStyleSheet(f"color: {MUTED};")
+        card.body.addWidget(live_hint)
 
         # 外观：浅色 / 深色 / 自动（对齐 macOS 外观设置的三张预览图）
         mode_row = QHBoxLayout()
@@ -539,6 +1085,8 @@ class SettingsPage(QWidget):
         self.browser_theme_select.setFixedWidth(190)
         for key, label in theme.BROWSER_THEME_LABELS.items():
             self.browser_theme_select.addItem(label, key)
+        self.browser_theme_select.currentIndexChanged.connect(
+            lambda _index: self._preview_appearance())
         browser_row.addWidget(self.browser_theme_select)
         card.body.addLayout(browser_row)
 
@@ -725,8 +1273,6 @@ class SettingsPage(QWidget):
         self._sync_mascot_controls()
 
 
-        font_row = QHBoxLayout()
-        font_row.setSpacing(10)
         font_text = QVBoxLayout()
         font_text.setSpacing(2)
         font_label = QLabel("字体")
@@ -738,7 +1284,22 @@ class SettingsPage(QWidget):
         font_desc.setWordWrap(True)
         font_text.addWidget(font_label)
         font_text.addWidget(font_desc)
-        font_row.addLayout(font_text, 2)
+        card.body.addLayout(font_text)
+
+        # 字体选择：分栏变窄时横向滚动，别把说明挤成一条
+        font_row = HScrollRow(height=58, spacing=10)
+
+        def _labelled(title: str, widget) -> QWidget:
+            """给下拉框加一行可见的小标题（截图里三个框光秃秃的，看不出谁是谁）。"""
+            box = QWidget()
+            column = QVBoxLayout(box)
+            column.setContentsMargins(0, 0, 0, 0)
+            column.setSpacing(2)
+            caption = QLabel(title)
+            caption.setObjectName("Tiny")
+            column.addWidget(caption)
+            column.addWidget(widget)
+            return box
 
         self.font_preset_select = Select()
         self.font_preset_select.setFixedWidth(216)
@@ -747,28 +1308,31 @@ class SettingsPage(QWidget):
             self.font_preset_select.addItem(preset["name"], preset["id"])
         self.font_preset_select.addItem("自定义（下方手动选择）", "custom")
         self.font_preset_select.currentIndexChanged.connect(self._on_font_preset)
-        font_row.addWidget(self.font_preset_select)
+        font_row.addWidget(_labelled("字体搭配（整套预设）",
+                                     self.font_preset_select))
 
         self.font_zh_select = Select()
         self.font_zh_select.setFixedWidth(190)
         self.font_zh_select.setToolTip("中文字体")
         self.font_zh_select.currentIndexChanged.connect(self._on_font_changed)
-        font_row.addWidget(self.font_zh_select)
+        font_row.addWidget(_labelled("中文字体", self.font_zh_select))
         self.font_en_select = Select()
         self.font_en_select.setFixedWidth(190)
         self.font_en_select.setToolTip("西文字体")
         self.font_en_select.currentIndexChanged.connect(self._on_font_changed)
-        font_row.addWidget(self.font_en_select)
+        font_row.addWidget(_labelled("西文字体", self.font_en_select))
         self.font_reset_button = SoftButton("恢复默认", "subtle", height=30, point_size=8.8)
         self.font_reset_button.clicked.connect(self._reset_fonts)
         font_row.addWidget(self.font_reset_button)
-        card.body.addLayout(font_row)
+        card.body.addWidget(font_row)
 
         self._refresh_appearance_ui()
         return card
 
     def _on_glass_toggled(self, checked: bool) -> None:
         self._glass = bool(checked)
+        # 磨砂玻璃开了/关了要马上能看到（不用等「保存设置」）
+        self._preview_appearance()
 
     def _on_mascot_toggled(self, checked: bool) -> None:
         """看板娘开关：立即生效（不用等保存）。"""
@@ -834,6 +1398,8 @@ class SettingsPage(QWidget):
     def _on_blur_changed(self, value: int) -> None:
         self._blur = float(value)
         self.blur_value.setText(f"{value} px")
+        # 拖滑杆时数值每变一点都会触发：节流之后再重画背景
+        self._preview_soon()
 
     # ---- 字体 ----
     @staticmethod
@@ -872,6 +1438,7 @@ class SettingsPage(QWidget):
         self._font_zh = self.font_zh_select.currentData() or ""
         self._font_en = self.font_en_select.currentData() or ""
         self._sync_font_preset()
+        self._preview_appearance()
 
     def _on_font_preset(self, _index: int) -> None:
         preset_id = self.font_preset_select.currentData() or "apple"
@@ -880,6 +1447,7 @@ class SettingsPage(QWidget):
                 self._font_zh = preset["zh"]
                 self._font_en = preset["en"]
                 self._fill_font_selects()
+                self._preview_appearance()
                 return
 
     def _reset_fonts(self) -> None:
@@ -887,6 +1455,7 @@ class SettingsPage(QWidget):
         self._font_en = ""
         self._sync_font_preset()
         self._fill_font_selects()
+        self._preview_appearance()
 
     def _sync_font_preset(self) -> None:
         if not hasattr(self, "font_preset_select"):
@@ -904,11 +1473,13 @@ class SettingsPage(QWidget):
     def _choose_mode(self, mode_id: str) -> None:
         self._mode = mode_id
         self._refresh_appearance_ui()
+        self._preview_appearance()
 
     def _choose_accent(self, accent: str, accent2: str) -> None:
         self._accent = accent
         self._accent2 = accent2
         self._refresh_appearance_ui()
+        self._preview_appearance()
 
     def _pick_custom_accent(self) -> None:
         color = QColorDialog.getColor(
@@ -918,10 +1489,12 @@ class SettingsPage(QWidget):
             self._accent = color.name()
             self._accent2 = theme.harmonize_accent(self._accent)
             self._refresh_appearance_ui()
+            self._preview_appearance()
 
     def _choose_bg(self, preset_id: str) -> None:
         self._bg = preset_id
         self._refresh_appearance_ui()
+        self._preview_appearance()
 
     def _restore_appearance(self) -> None:
         self._accent = theme.DEFAULT_APPEARANCE["accent"]
@@ -932,6 +1505,68 @@ class SettingsPage(QWidget):
         self._blur = theme.DEFAULT_APPEARANCE["blur"]
         self._mode = theme.DEFAULT_APPEARANCE["mode"]
         self._refresh_appearance_ui()
+        self._preview_appearance()
+
+    # -------------------------------------------------- 外观实时预览
+    def _preview_appearance(self, message: str = "") -> None:
+        """把外观控件里「现在这些值」立刻套到界面上，并顺手存下来。
+
+        以前这些只在点「保存设置」时才生效，换强调色/深浅色得先保存才能看到，
+        现在点一下就变、滑杆一拖就变（滑杆那种连续变化走 `_preview_soon()` 节流）。
+        只重刷主题，不重读各页面的数据，所以不会把正在填的表单清掉。
+        """
+        try:
+            self._preview_timer.stop()
+        except Exception:
+            pass
+        if not hasattr(self, "alpha_slider"):
+            return          # 控件还没建完（构造期间滑块初始化会触发）
+        if not getattr(self, "_preview_ready", False):
+            return          # 建页面 / 首次回填阶段不做预览，免得启动就白刷一遍主题
+        try:
+            theme.set_appearance(self._accent, self._accent2, self._bg, self._alpha,
+                                 self._glass, self._blur, self._mode)
+            theme.set_fonts(self._font_zh, self._font_en)
+            select = getattr(self, "browser_theme_select", None)
+            if select is not None:
+                theme.set_browser_theme(select.currentData() or "follow")
+            theme.save_to_store(self.store)
+        except Exception:
+            pass
+        self._refresh_appearance_ui()
+        window = self.window()
+        handler = getattr(window, "preview_appearance", None)
+        if callable(handler):
+            try:
+                handler(message, refresh_pages=False)
+                return
+            except TypeError:
+                try:
+                    handler(message)
+                    return
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            theme.apply_theme(QApplication.instance())
+        except Exception:
+            pass
+        try:
+            self.update()
+        except Exception:
+            pass
+
+    def _preview_soon(self) -> None:
+        """连续变化（模糊度滑杆）用：120ms 内的多次改动只应用一次。"""
+        if not getattr(self, "_preview_ready", False):
+            return
+        timer = getattr(self, "_preview_timer", None)
+        if timer is None:
+            self._preview_appearance()
+            return
+        if not timer.isActive():
+            timer.start(120)
 
     def _on_alpha_changed(self, value: int) -> None:
         self._alpha = value / 100.0
@@ -949,6 +1584,10 @@ class SettingsPage(QWidget):
 
     def _on_alpha_released(self) -> None:
         """松开滑块后再补一次完整重绘，避免拖动过程留下残影。"""
+        try:
+            theme.save_to_store(self.store)      # 松手即保存，别等「保存设置」
+        except Exception:
+            pass
         try:
             window = self.window()
             if window is not None:
@@ -972,11 +1611,20 @@ class SettingsPage(QWidget):
         self._custom_swatch.set_selected(not matched)
         for chip, preset_id in self._bg_chips:
             chip.set_selected(preset_id == self._bg)
+        # 回填滑杆时别触发预览（否则每建一次设置页都白刷一遍主题）
+        for widget in (getattr(self, "alpha_slider", None),
+                       getattr(self, "blur_slider", None)):
+            if widget is not None:
+                widget.blockSignals(True)
         self.alpha_slider.setValue(int(round(self._alpha * 100)))
         self.alpha_value.setText(f"{int(round(self._alpha * 100))}%")
         if hasattr(self, "blur_slider"):
             self.blur_slider.setValue(int(round(self._blur)))
             self.blur_value.setText(f"{int(round(self._blur))} px")
+        for widget in (getattr(self, "alpha_slider", None),
+                       getattr(self, "blur_slider", None)):
+            if widget is not None:
+                widget.blockSignals(False)
         if hasattr(self, "glass_switch"):
             self.glass_switch.blockSignals(True)
             self.glass_switch.setChecked(bool(self._glass), animate=False)
@@ -1063,7 +1711,65 @@ class SettingsPage(QWidget):
         self.test_status.setObjectName("Small")
         controls.addWidget(self.test_status, 1)
         card.body.addLayout(controls)
+
+        # ---------------- OAuth2（Outlook / 微软账户发信必须用它）
+        oauth_row = QHBoxLayout()
+        oauth_row.setSpacing(10)
+        oauth_text = QVBoxLayout()
+        oauth_text.setSpacing(2)
+        oauth_label = QLabel("用 OAuth2 登录（Outlook / 微软账户）")
+        oauth_label.setStyleSheet(f"color: {TEXT}; font-size: 10pt; font-weight: 600;")
+        oauth_desc = QLabel(
+            "微软从 2024 年起关停了 outlook.com / hotmail.com 的「账号密码 + 应用密码」发信，"
+            "只能用 OAuth2。点右边「微软授权」走一次设备代码流程即可（不需要填密码）。")
+        oauth_desc.setObjectName("Tiny")
+        oauth_desc.setWordWrap(True)
+        oauth_text.addWidget(oauth_label)
+        oauth_text.addWidget(oauth_desc)
+        oauth_row.addLayout(oauth_text, 1)
+        self.oauth_switch = ToggleSwitch(
+            (self.store.get_setting("smtp_oauth", "0") or "0") == "1")
+        self.oauth_switch.toggled.connect(self._on_smtp_oauth_toggled)
+        oauth_row.addWidget(self.oauth_switch)
+        self.oauth_button = SoftButton("微软授权", "ghost", height=32,
+                                       min_width=96, point_size=8.6)
+        self.oauth_button.clicked.connect(self._open_oauth_dialog)
+        oauth_row.addWidget(self.oauth_button)
+        card.body.addLayout(oauth_row)
+
+        self.oauth_status = QLabel("")
+        self.oauth_status.setObjectName("Tiny")
+        self.oauth_status.setWordWrap(True)
+        card.body.addWidget(self.oauth_status)
+        self._refresh_oauth_status()
         return card
+
+    # -------------------------------------------------- 发件的 OAuth2
+    def _on_smtp_oauth_toggled(self, checked: bool) -> None:
+        self.store.set_setting("smtp_oauth", "1" if checked else "0")
+        self._refresh_oauth_status()
+
+    def _open_oauth_dialog(self) -> None:
+        from .oauth_dialog import OAuthDialog
+
+        dialog = OAuthDialog(self.store, self.window())
+        dialog.exec()
+        self._refresh_oauth_status()
+
+    def _refresh_oauth_status(self) -> None:
+        from . import oauth2
+
+        if not hasattr(self, "oauth_status"):
+            return
+        enabled = (self.store.get_setting("smtp_oauth", "0") or "0") == "1"
+        parts = ["OAuth2：已启用" if enabled else "OAuth2：未启用"]
+        if not oauth2.configured(self.store):
+            parts.append("还没填客户端 ID（点「微软授权」里面填）")
+        elif oauth2.has_refresh_token(self.store):
+            parts.append("已授权（发信会自动续期）")
+        else:
+            parts.append("还没授权（点「微软授权」走一次流程）")
+        self.oauth_status.setText("；".join(parts))
 
     # -------------------------------------------------- 课程表（可选）
     def _build_timetable_card(self) -> Card:
@@ -1090,8 +1796,8 @@ class SettingsPage(QWidget):
         enable_row.addWidget(self.timetable_switch)
         card.body.addLayout(enable_row)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
+        # 分栏变窄时这两排按钮放不下 → 横向滚动（不挤在一起）
+        actions = HScrollRow(height=40, spacing=8)
         self.import_ics_button = SoftButton("导入 .ics 课表", "ghost", glyph=icons.ADD,
                                             height=34, min_width=132, point_size=8.8)
         self.import_ics_button.clicked.connect(self._import_timetable)
@@ -1101,11 +1807,10 @@ class SettingsPage(QWidget):
         self.detect_danxi_button.clicked.connect(self._detect_danxi)
         actions.addWidget(self.detect_danxi_button)
         actions.addStretch(1)
-        card.body.addLayout(actions)
+        card.body.addWidget(actions)
 
         # ---- 复旦教务直连（内嵌浏览器登录后抓取）----
-        fdu_row = QHBoxLayout()
-        fdu_row.setSpacing(8)
+        fdu_row = HScrollRow(height=40, spacing=8)
         self.fdu_button = SoftButton("登录教务抓取课表", "primary", height=34,
                                      min_width=158, point_size=8.8)
         self.fdu_button.clicked.connect(self._sync_from_fdu)
@@ -1121,10 +1826,10 @@ class SettingsPage(QWidget):
         fdu_row.addWidget(term_label)
         self.term_start_edit = QLineEdit()
         self.term_start_edit.setPlaceholderText("例如 2026-09-07")
-        self.term_start_edit.setFixedWidth(120)
+        self.term_start_edit.setFixedWidth(132)
         fdu_row.addWidget(self.term_start_edit)
         fdu_row.addStretch(1)
-        card.body.addLayout(fdu_row)
+        card.body.addWidget(fdu_row)
 
         self.timetable_status = QLabel("")
         self.timetable_status.setObjectName("Small")
@@ -1158,6 +1863,11 @@ class SettingsPage(QWidget):
         self.import_ics_button.setEnabled(bool(checked))
         self.detect_danxi_button.setEnabled(bool(checked))
         self.fdu_button.setEnabled(bool(checked))
+        # 拨一下就存下来，不用等「保存设置」
+        try:
+            self.store.set_setting("timetable_enabled", "1" if checked else "0")
+        except Exception:
+            pass
 
     def _set_timetable_status(self, message: str, color: str) -> None:
         if not hasattr(self, "timetable_status"):
@@ -1652,7 +2362,7 @@ class SettingsPage(QWidget):
         for item in LLM_PRESETS:
             self.llm_preset_select.addItem(item["name"], item["id"])
         preset_id = self.store.get_setting("llm_preset", "") or self._guess_llm_preset(
-            cfg.get("llm_base_url", ""))
+            cfg.get("llm_base_url", ""), self.store.get_setting("llm_model_name", ""))
         self.llm_preset_select.blockSignals(True)
         index = self.llm_preset_select.findData(preset_id)
         self.llm_preset_select.setCurrentIndex(max(0, index))
@@ -1663,6 +2373,38 @@ class SettingsPage(QWidget):
         self.llm_preset_hint.setObjectName("Tiny")
         preset_row.addWidget(self.llm_preset_hint, 1)
         card.body.addLayout(preset_row)
+
+        # ---- 多套 API 配置：接口地址 + 模型 + Key 可以存好几套，随时切换 ----
+        profile_row = QHBoxLayout()
+        profile_row.setSpacing(8)
+        profile_label = QLabel("API 配置")
+        profile_label.setObjectName("Small")
+        profile_row.addWidget(profile_label)
+        self.llm_profile_select = Select()
+        self.llm_profile_select.setFixedWidth(200)
+        self.llm_profile_select.setToolTip(
+            "同一个程序里可以存多套接口（比如「内网 Qwen」「DeepSeek 官方」），"
+            "选了哪个，AI 面板的对话和 Agent 就用哪个")
+        profile_row.addWidget(self.llm_profile_select)
+        self.llm_profile_name_edit = QLineEdit()
+        self.llm_profile_name_edit.setFixedWidth(150)
+        self.llm_profile_name_edit.setPlaceholderText("这套配置的名字")
+        self.llm_profile_name_edit.setToolTip("改完点下面的「保存设置」就会记住")
+        profile_row.addWidget(self.llm_profile_name_edit)
+        self.llm_profile_new_button = SoftButton("另存为新配置", "ghost", height=30,
+                                                min_width=118, point_size=8.6)
+        self.llm_profile_new_button.setToolTip(
+            "把下面填的地址 / 模型 / Key 存成一套新的配置，同时切换到它")
+        self.llm_profile_new_button.clicked.connect(self._save_profile_as_new)
+        profile_row.addWidget(self.llm_profile_new_button)
+        self.llm_profile_delete_button = SoftButton("删除这套", "ghost", height=30,
+                                                    min_width=92, point_size=8.6)
+        self.llm_profile_delete_button.setToolTip("删掉当前这套配置（最后一套不能删）")
+        self.llm_profile_delete_button.clicked.connect(self._delete_llm_profile)
+        profile_row.addWidget(self.llm_profile_delete_button)
+        profile_row.addStretch(1)
+        card.body.addLayout(profile_row)
+        self._reload_llm_profiles()
 
         runtime_row = QHBoxLayout()
         runtime_row.setSpacing(10)
@@ -1761,14 +2503,151 @@ class SettingsPage(QWidget):
         api_label = QLabel("API Key")
         api_label.setObjectName("Small")
         key_row.addWidget(api_label)
-        has_api_key = bool(self.store.get_secret("llm_api_key", ""))
+        has_api_key = self._has_llm_key()
         self.llm_api_edit = QLineEdit()
         self.llm_api_edit.setPlaceholderText(
-            "已保存（不可查看），留空表示不修改" if has_api_key else "本地模型留空")
+            "已保存（不可查看），留空表示不修改" if has_api_key
+            else "这套还没填 Key（本地模型可留空）")
         self.llm_api_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.llm_api_edit.setFixedWidth(220)
         key_row.addWidget(self.llm_api_edit)
         card.body.addLayout(key_row)
+
+        # 思考模式：真的关掉思考（不是把思考过程藏起来）
+        think_row = QHBoxLayout()
+        think_row.setSpacing(8)
+        think_label = QLabel("思考")
+        think_label.setObjectName("Small")
+        think_row.addWidget(think_label)
+        self.llm_think_select = Select()
+        self.llm_think_select.setFixedWidth(168)
+        self.llm_think_select.setToolTip(
+            "「关闭思考」是在请求里就让模型别思考（按服务自动挑对参数），"
+            "不是把思考过程藏起来；遇到关不掉的推理模型会提示你换模型")
+        try:
+            from . import ai_thinking
+
+            for mode_id in ai_thinking.MODES:
+                self.llm_think_select.addItem(
+                    ai_thinking.MODE_LABELS.get(mode_id, mode_id), mode_id)
+            current = ai_thinking.mode(self.store)
+            index = self.llm_think_select.findData(current)
+            if index >= 0:
+                self.llm_think_select.setCurrentIndex(index)
+            self.llm_think_select.currentIndexChanged.connect(
+                self._on_llm_think_changed)
+            self.llm_think_hint = QLabel(self._llm_think_hint_text())
+        except Exception:
+            self.llm_think_hint = QLabel("")
+        self.llm_think_hint.setObjectName("Tiny")
+        self.llm_think_hint.setWordWrap(True)
+        think_row.addWidget(self.llm_think_select)
+        think_row.addWidget(self.llm_think_hint, 1)
+        card.body.addLayout(think_row)
+
+        # ---- 本地资源（沙盒）：AI 能不能读写这台机器上的文件 ----
+        local_head = QHBoxLayout()
+        local_head.setSpacing(8)
+        local_label = QLabel("本地资源")
+        local_label.setObjectName("Small")
+        local_head.addWidget(local_label)
+        self.local_mode_select = Select()
+        self.local_mode_select.setFixedWidth(210)
+        self.local_mode_select.setToolTip(
+            "关闭：AI 完全碰不到本地文件\n"
+            "只读：可以列目录、读文件、按内容搜\n"
+            "读写：还能新建/覆盖文件（仍然只在下面这些目录里）")
+        try:
+            from . import ai_local
+
+            for mode_id in ai_local.MODES:
+                self.local_mode_select.addItem(
+                    ai_local.MODE_LABELS.get(mode_id, mode_id), mode_id)
+            index = self.local_mode_select.findData(ai_local.mode(self.store))
+            if index >= 0:
+                self.local_mode_select.setCurrentIndex(index)
+            self.local_mode_select.currentIndexChanged.connect(
+                self._on_local_mode_changed)
+        except Exception:
+            pass
+        local_head.addWidget(self.local_mode_select)
+        self.local_open_button = SoftButton("打开工作区", "ghost", height=30,
+                                            min_width=104, point_size=8.6)
+        self.local_open_button.setToolTip("在文件管理器里打开 AI 的工作区目录")
+        self.local_open_button.clicked.connect(self._open_agent_workspace)
+        local_head.addWidget(self.local_open_button)
+        self.local_add_button = SoftButton("添加目录…", "ghost", height=30,
+                                           min_width=104, point_size=8.6)
+        self.local_add_button.setToolTip("把别的文件夹也允许给 AI 用（比如某个项目目录）")
+        self.local_add_button.clicked.connect(self._add_local_root)
+        local_head.addWidget(self.local_add_button)
+        self.local_log_button = SoftButton("操作记录", "ghost", height=30,
+                                           min_width=96, point_size=8.6)
+        self.local_log_button.setToolTip("看看 AI 到底碰过哪些文件（每次都有记录）")
+        self.local_log_button.clicked.connect(self._show_local_audit)
+        local_head.addWidget(self.local_log_button)
+        local_head.addStretch(1)
+        card.body.addLayout(local_head)
+        self.local_roots_label = QLabel(self._local_roots_text())
+        self.local_roots_label.setObjectName("Tiny")
+        self.local_roots_label.setWordWrap(True)
+        card.body.addWidget(self.local_roots_label)
+
+        self.local_direct_button = SoftButton("直接访问设置…", "ghost", height=30,
+                                              min_width=124, point_size=8.6)
+        self.local_direct_button.setToolTip(
+            "白名单里的目录默认「每次操作要你确认」；在这里勾上的目录可以免确认"
+            "（理解成「本次工作的本地源」）")
+        self.local_direct_button.clicked.connect(self._edit_local_direct)
+        direct_row = QHBoxLayout()
+        direct_row.addWidget(self.local_direct_button)
+        direct_row.addStretch(1)
+        card.body.addLayout(direct_row)
+
+        # ---- 工具审核：每个 skill/tool 都能被用户单独关掉 ----
+        audit_head = QLabel("工具审核")
+        audit_head.setStyleSheet(
+            f"color: {TEXT}; font-size: 10pt; font-weight: 600; margin-top: 6px;")
+        card.body.addWidget(audit_head)
+        audit_desc = QLabel(
+            "下面是 AI 能用的全部工具。低风险默认开，中高风险默认关；"
+            "关掉之后模型连这个工具都不会看到。改动立刻生效。")
+        audit_desc.setObjectName("Tiny")
+        audit_desc.setWordWrap(True)
+        card.body.addWidget(audit_desc)
+        self.tool_switches: Dict[str, Any] = {}
+        try:
+            from . import ai_tools
+
+            for item in ai_tools.catalog(self.store):
+                row = QHBoxLayout()
+                row.setSpacing(8)
+                text_box = QVBoxLayout()
+                text_box.setSpacing(1)
+                name_label = QLabel(f"{item['label']}（{item['name']}）")
+                name_label.setStyleSheet(
+                    f"color: {TEXT}; font-size: 9.4pt; font-weight: 600;")
+                desc_label = QLabel(item["desc"])
+                desc_label.setObjectName("Tiny")
+                desc_label.setWordWrap(True)
+                text_box.addWidget(name_label)
+                text_box.addWidget(desc_label)
+                row.addLayout(text_box, 1)
+                risk_label = QLabel(item["risk_label"])
+                risk_label.setObjectName("Tiny")
+                risk_label.setStyleSheet(
+                    f"color: {WARNING if item['risk'] != 'low' else MUTED};")
+                risk_label.setFixedWidth(64)
+                row.addWidget(risk_label)
+                switch = ToggleSwitch(bool(item["enabled"]))
+                switch.toggled.connect(
+                    lambda checked, name=item["name"]:
+                    self._on_tool_toggled(name, checked))
+                self.tool_switches[item["name"]] = switch
+                row.addWidget(switch)
+                card.body.addLayout(row)
+        except Exception:
+            pass
 
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
@@ -1798,6 +2677,26 @@ class SettingsPage(QWidget):
         action_row.addStretch(1)
         card.body.addLayout(action_row)
 
+        # 管理员模型接口：需要授权（每次最多 5 小时）
+        grant_row = HScrollRow(height=40, spacing=8)
+        self.grant_button = SoftButton("申请模型接口权限", "ghost", height=32,
+                                       min_width=150, point_size=8.6)
+        self.grant_button.setToolTip(
+            "用管理员的模型接口（如 10.137.44.215）需要先发申请，"
+            "管理员批准后把邮件里的授权粘回来")
+        self.grant_button.clicked.connect(self._request_api_grant)
+        grant_row.addWidget(self.grant_button)
+        self.grant_paste_button = SoftButton("粘贴授权", "ghost", height=32,
+                                             min_width=104, point_size=8.6)
+        self.grant_paste_button.clicked.connect(self._paste_api_grant)
+        grant_row.addWidget(self.grant_paste_button)
+        self.grant_label = QLabel("")
+        self.grant_label.setObjectName("Tiny")
+        self.grant_label.setWordWrap(True)
+        grant_row.addWidget(self.grant_label)
+        grant_row.addStretch(1)
+        card.body.addWidget(grant_row)
+
         self.llm_status = QLabel("")
         self.llm_status.setObjectName("Tiny")
         self.llm_status.setWordWrap(True)
@@ -1818,12 +2717,97 @@ class SettingsPage(QWidget):
     def _llm_runner(self):
         return getattr(self.window(), "llm_runner", None)
 
+    # -------------------------------------------------- 模型接口授权
+    def _refresh_grant_label(self) -> None:
+        from . import api_grant, users
+
+        if not hasattr(self, "grant_label"):
+            return
+        try:
+            base = (self.llm_base_edit.text() if hasattr(self, "llm_base_edit")
+                    else self.store.get_setting("llm_base_url", "") or "")
+        except Exception:
+            base = ""
+        if not api_grant.is_admin_endpoint(self.store, base):
+            self.grant_label.setText("当前接口不需要授权（不是管理员的模型地址）")
+            return
+        try:
+            admin = users.is_admin_now(self.store)
+        except Exception:
+            admin = False
+        if admin:
+            self.grant_label.setStyleSheet("")
+            self.grant_label.setText(
+                "管理员使用自己的模型接口，不需要申请、也没有 5 小时限制")
+            for button in (self.grant_button, self.grant_paste_button):
+                try:
+                    button.setVisible(False)
+                except Exception:
+                    pass
+            return
+        for button in (self.grant_button, self.grant_paste_button):
+            try:
+                button.setVisible(True)
+            except Exception:
+                pass
+        state = api_grant.grant_state(self.store, base)
+        self.grant_label.setText(state["text"])
+
+    def _request_api_grant(self) -> None:
+        from . import api_grant
+
+        try:
+            result = api_grant.send_request(self.store, api_grant.GRANT_MAX_HOURS)
+        except api_grant.GrantError as exc:
+            self._set_grant_status(str(exc), DANGER)
+            return
+        if result.get("sent"):
+            self._set_grant_status(
+                f"申请已发到 {result['to']}，请等管理员批准（批准后把邮件里的授权粘回来）",
+                SUCCESS)
+        else:
+            self._set_grant_status(
+                f"{result.get('error')}；申请内容已复制到剪贴板，直接粘贴发送即可",
+                WARNING)
+            try:
+                QApplication.clipboard().setText(str(result.get("body") or ""))
+            except Exception:
+                pass
+
+    def _paste_api_grant(self) -> None:
+        from . import adminsign, api_grant
+
+        text, ok = QInputDialog.getMultiLineText(
+            self, "粘贴模型接口授权", "把邮件里以 LUMINA-GRANT1. 开头那一行粘进来：")
+        if not ok or not text.strip():
+            return
+        token = api_grant.extract_grant(text) or text.strip()
+        pub = adminsign.public_pem(self.store)
+        try:
+            payload = api_grant.save_grant(self.store, token, pub)
+        except api_grant.GrantError as exc:
+            self._set_grant_status(str(exc), DANGER)
+            return
+        self._set_grant_status(
+            f"授权已生效：{payload.get('hours', '?')} 小时，到 "
+            f"{payload.get('expires_at')} 为止", SUCCESS)
+        self._refresh_grant_label()
+
+    def _set_grant_status(self, text: str, color: str) -> None:
+        self.grant_label.setStyleSheet(f"color: {color};")
+        self.grant_label.setText(text)
+
     # -------------------------------------------------- AI 接口预设
     @staticmethod
-    def _guess_llm_preset(base_url: str) -> str:
+    def _guess_llm_preset(base_url: str, model_name: str = "") -> str:
         url = (base_url or "").lower()
+        name = (model_name or "").lower()
         for item in LLM_PRESETS:
-            if item["id"] != "custom" and item["base"] and item["base"].lower() == url:
+            if item["id"] == "custom" or not item["base"]:
+                continue
+            if item["base"].lower() != url:
+                continue
+            if not item["model"] or not name or item["model"].lower() == name:
                 return item["id"]
         if "deepseek" in url:
             return "deepseek"
@@ -1852,6 +2836,7 @@ class SettingsPage(QWidget):
         tips = {
             "local": "先填模型路径并「启动本地模型」",
             "deepseek": "API Key 在 platform.deepseek.com 申请",
+            "deepseek-r1": "R1 才会返回「思考过程」，比 chat 慢一点，适合推理题",
             "doubao": "模型名填方舟里的接入点 ID（ep-…）",
             "kimi": "API Key 在 platform.moonshot.cn 申请",
         }
@@ -1876,6 +2861,212 @@ class SettingsPage(QWidget):
             self._llm_mode_hint = hint
         except Exception:
             pass
+
+    def _llm_think_hint_text(self) -> str:
+        """思考模式下面那句说明：会按当前服务和模型解释「关得掉吗」。"""
+        try:
+            from . import ai_thinking
+
+            model = (self.store.get_setting("llm_model_name", "") or "").strip()
+            base = (self.store.get_setting("llm_base_url", "") or "").strip()
+            note = ai_thinking.note(self.store, model, base)
+            if note:
+                return note
+            return {
+                "off": "下次请求就不让模型思考（更快、更省 token）",
+                "on": "要求模型先思考（有的模型默认不思考）",
+                "auto": "不额外传参数，让模型自己决定",
+            }.get(ai_thinking.mode(self.store), "")
+        except Exception:
+            return ""
+
+    def _on_llm_think_changed(self, _index: int) -> None:
+        try:
+            from . import ai_thinking
+
+            mode_id = self.llm_think_select.currentData() or "auto"
+            ai_thinking.set_mode(self.store, str(mode_id))
+            hint = self._llm_think_hint_text()
+            self.llm_think_hint.setText(hint)
+            if str(mode_id) == "off":
+                self.notify.emit(hint or "已关闭思考：请求里就不让模型思考了")
+            elif str(mode_id) == "on":
+                self.notify.emit(hint or "已要求模型思考")
+            else:
+                self.notify.emit("思考交回模型自己决定")
+        except Exception:
+            pass
+
+    def _local_roots_text(self) -> str:
+        """本地资源下面那行小字：现在允许哪些目录。"""
+        try:
+            from . import ai_local
+
+            info = ai_local.summary(self.store)
+            if not info["enabled"]:
+                return ("现在是「关闭」档：AI 不会读写任何本地文件。"
+                        "要让它能看某个目录，把上面切成「只读」或「读写」。")
+            roots = "；".join(info["roots"])
+            extra = "" if info["can_write"] else "（只读档：不能改文件）"
+            return f"允许的目录：{roots}{extra}"
+        except Exception:
+            return ""
+
+    def _refresh_local_roots_label(self) -> None:
+        label = getattr(self, "local_roots_label", None)
+        if label is not None:
+            label.setText(self._local_roots_text())
+
+    def _on_local_mode_changed(self, _index: int) -> None:
+        try:
+            from . import ai_local
+
+            mode_id = self.local_mode_select.currentData() or "off"
+            ai_local.set_mode(self.store, str(mode_id))
+            self._refresh_local_roots_label()
+            self.notify.emit({
+                "off": "本地资源已关闭：AI 不再读写本地文件",
+                "read": "本地资源已设为「只读」：AI 只能看，不能改",
+                "write": "本地资源已设为「读写」：AI 可以在允许的目录里新建/修改文件",
+            }.get(str(mode_id), "本地资源设置已更新"))
+        except Exception:
+            pass
+
+    def _open_agent_workspace(self) -> None:
+        try:
+            from . import ai_local
+
+            path = ai_local.workspace(self.store)
+            from PySide6.QtCore import QUrl
+            from PySide6.QtGui import QDesktopServices
+
+            open_external(str(path), local=True)
+            self.notify.emit(f"已打开工作区：{path}")
+        except Exception as exc:  # noqa: BLE001
+            self.notify.emit(f"打不开工作区：{exc}")
+
+    def _add_local_root(self) -> None:
+        try:
+            from . import ai_local
+
+            folder = QFileDialog.getExistingDirectory(
+                self, "选择允许 AI 访问的目录", str(Path.home()))
+            if not folder:
+                return
+            roots = ai_local.add_root(self.store, folder)
+            self._refresh_local_roots_label()
+            if ai_local.mode(self.store) == "off":
+                index = self.local_mode_select.findData("read")
+                if index >= 0:
+                    self.local_mode_select.setCurrentIndex(index)
+            self.notify.emit(f"已加入允许目录（共 {len(roots)} 个）：{folder}")
+        except Exception as exc:  # noqa: BLE001
+            self.notify.emit(f"添加目录失败：{exc}")
+
+    def _show_local_audit(self) -> None:
+        """把最近的文件操作记录显示出来（谁在什么时候动了哪个文件）。"""
+        try:
+            from . import ai_local
+
+            lines = ai_local.audit_lines(self.store, limit=60)
+            if not lines:
+                self.notify.emit("还没有任何本地文件操作记录")
+                return
+            action_names = {"list": "列目录", "read": "读", "write": "写",
+                            "search": "搜索"}
+            text = "\n".join(
+                f"{item.get('at','')}  {action_names.get(item.get('action'), item.get('action'))}"
+                f"  {item.get('path','')}"
+                + ("" if item.get("ok") else f"  ✗ {item.get('note','')}")
+                for item in lines[-30:])
+            from PySide6.QtWidgets import QDialog
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle("AI 的本地文件操作记录")
+            layout = QVBoxLayout(dialog)
+            view = QPlainTextEdit()
+            view.setReadOnly(True)
+            view.setPlainText(text)
+            view.setMinimumSize(640, 420)
+            layout.addWidget(view)
+            close = SoftButton("关闭", "ghost", height=32, min_width=88)
+            close.clicked.connect(dialog.accept)
+            row = QHBoxLayout()
+            row.addStretch(1)
+            row.addWidget(close)
+            layout.addLayout(row)
+            dialog.exec()
+        except Exception as exc:  # noqa: BLE001
+            self.notify.emit(f"看不了记录：{exc}")
+
+    def _on_tool_toggled(self, name: str, checked: bool) -> None:
+        """工具审核：单个工具开关（立刻生效，模型那边下一轮就看不到它了）。"""
+        try:
+            from . import ai_tools
+
+            ai_tools.set_tool_enabled(self.store, name, bool(checked))
+            label = ai_tools.LABELS.get(name, name)
+            self.notify.emit(f"「{label}」已{'打开' if checked else '关掉'}")
+        except Exception as exc:  # noqa: BLE001
+            self.notify.emit(f"改工具开关失败：{exc}")
+
+    def _edit_local_direct(self) -> None:
+        """哪些目录可以「直接访问」（工作区外的目录默认每次都要确认）。"""
+        try:
+            from . import ai_local
+
+            roots = ai_local.roots(self.store)
+            if not roots:
+                self.notify.emit("还没有允许的目录，先点「添加目录…」")
+                return
+            from PySide6.QtWidgets import QDialog
+
+            dialog = QDialog(self)
+            dialog.setWindowTitle("哪些目录可以直接访问？")
+            layout = QVBoxLayout(dialog)
+            hint = QLabel("勾上的目录：AI 读写不用问你。没勾的：每次操作都会弹窗确认。"
+                          "内置工作区默认就是直接访问。")
+            hint.setWordWrap(True)
+            hint.setObjectName("Tiny")
+            layout.addWidget(hint)
+            switches: List[Any] = []
+            for root in roots:
+                row = QHBoxLayout()
+                row.setSpacing(8)
+                is_workspace = str(root) == str(ai_local.workspace(self.store))
+                label = QLabel(str(root) + ("（内置工作区）" if is_workspace else ""))
+                label.setWordWrap(True)
+                row.addWidget(label, 1)
+                switch = ToggleSwitch(bool(ai_local.is_direct(self.store, root)))
+                if is_workspace:
+                    switch.setEnabled(False)
+                row.addWidget(switch)
+                switches.append((root, switch))
+                layout.addLayout(row)
+            buttons = QHBoxLayout()
+            buttons.addStretch(1)
+            cancel = SoftButton("取消", "ghost", height=32, min_width=80)
+            save = SoftButton("保存", "primary", height=32, min_width=88)
+            cancel.clicked.connect(dialog.reject)
+
+            def save_choices() -> None:
+                for root, switch in switches:
+                    try:
+                        ai_local.set_direct(self.store, str(root),
+                                            bool(switch.isChecked()))
+                    except Exception:
+                        continue
+                self._refresh_local_roots_label()
+                dialog.accept()
+                self.notify.emit("「直接访问」设置已保存（没勾的目录以后每次都会问你）")
+
+            save.clicked.connect(save_choices)
+            buttons.addWidget(cancel)
+            buttons.addWidget(save)
+            layout.addLayout(buttons)
+            dialog.exec()
+        except Exception as exc:  # noqa: BLE001
+            self.notify.emit(f"设置直接访问失败：{exc}")
 
     def _open_api_chat(self) -> None:
         """在中栏打开内置的 API 对话窗格。"""
@@ -1924,13 +3115,183 @@ class SettingsPage(QWidget):
             "llm_model_name": self.llm_model_name_edit.text().strip(),
         }
 
-    def _save_llm_settings(self) -> None:
+    def _reload_llm_profiles(self) -> None:
+        """把库里的配置列表填进下拉（保持当前选中）。"""
+        from . import llm_profiles
+
+        box = getattr(self, "llm_profile_select", None)
+        if box is None:
+            return
+        try:
+            llm_profiles.migrate(self.store)
+            items = llm_profiles.list_profiles(self.store)
+            active = llm_profiles.active_id(self.store)
+        except Exception:
+            items, active = [], None
+        box.blockSignals(True)
+        box.clear()
+        for item in items:
+            box.addItem(str(item.get("label") or item.get("name") or "配置"),
+                        int(item["id"]))
+        if active is not None:
+            index = box.findData(int(active))
+            if index >= 0:
+                box.setCurrentIndex(index)
+        box.blockSignals(False)
+        try:
+            box.currentIndexChanged.connect(self._on_llm_profile_selected)
+        except Exception:
+            pass
+        profile = None
+        try:
+            profile = llm_profiles.active(self.store)
+        except Exception:
+            profile = None
+        if profile is not None:
+            name_edit = getattr(self, "llm_profile_name_edit", None)
+            if name_edit is not None:
+                name_edit.setText(str(profile.get("name") or ""))
+
+    def _has_llm_key(self) -> bool:
+        """这一套配置到底存没存 Key：**先看当前配置**，再看老字段。
+
+        以前只看老字段 `llm_api_key`，而设置页里换了「API 配置」之后老字段
+        可能还没投影过来 —— 用户明明填了 Key，这里却显示「这套没填 Key」。
+        """
+        try:
+            from . import llm_profiles
+
+            pid = llm_profiles.active_id(self.store)
+            if pid and llm_profiles.secret(self.store, pid):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(self.store.get_secret("llm_api_key", ""))
+        except Exception:
+            return False
+
+    def _refresh_key_placeholder(self) -> None:
+        """按「这一套有没有 Key」更新输入框的灰字提示。"""
+        edit = getattr(self, "llm_api_edit", None)
+        if edit is None:
+            return
+        edit.setPlaceholderText(
+            "已保存（不可查看），留空表示不修改" if self._has_llm_key()
+            else "这套还没填 Key（本地模型可留空）")
+
+    def _on_llm_profile_selected(self, _index: int) -> None:
+        """设置页里换一套配置：切成当前，并把它的值填到下面的输入框。"""
+        from . import llm_profiles
+
+        box = getattr(self, "llm_profile_select", None)
+        if box is None:
+            return
+        profile_id = box.currentData()
+        if profile_id is None:
+            return
+        try:
+            profile = llm_profiles.set_active(self.store, int(profile_id))
+        except Exception as exc:  # noqa: BLE001
+            self.notify.emit("切换配置失败：%s" % exc)
+            return
+        if profile is None:
+            return
+        for attr, value in (("llm_base_edit", profile.get("base_url")),
+                            ("llm_model_name_edit", profile.get("model")),
+                            ("llm_profile_name_edit", profile.get("name"))):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setText(str(value or ""))
+        api_edit = getattr(self, "llm_api_edit", None)
+        if api_edit is not None:
+            has = bool(profile.get("has_key"))
+            api_edit.clear()
+            api_edit.setPlaceholderText(
+                "已保存（不可查看），留空表示不修改" if has
+                else "这套还没填 Key（本地模型可留空）")
+        self.notify.emit("已切换到「%s」" % (profile.get("label") or profile.get("name")))
+
+    def _save_profile_as_new(self) -> None:
+        """把当前输入框里的地址 / 模型 / Key 存成一套新配置并切过去。"""
+        from . import llm_profiles
+
+        wanted = self.llm_profile_name_edit.text().strip()
+        # 先保存界面上的值，但**别**把当前这套改名成新名字（那是给新配置用的）
+        self._save_llm_settings(sync_name=False)
+        try:
+            profile = llm_profiles.active(self.store)
+            name = wanted
+            if not name or (profile is not None and name == str(profile.get("name"))):
+                name = ""
+            pid = llm_profiles.create_profile(
+                self.store, name,
+                self.llm_base_edit.text().strip(),
+                self.llm_model_name_edit.text().strip(),
+                self.llm_api_edit.text().strip() or
+                (llm_profiles.secret(self.store, profile["id"]) if profile else ""),
+                self.llm_preset_select.currentData() or "")
+            llm_profiles.set_active(self.store, pid)
+        except Exception as exc:  # noqa: BLE001
+            self.notify.emit("另存失败：%s" % exc)
+            return
+        self._reload_llm_profiles()
+        self.notify.emit("已存成新配置，并切换到它")
+
+    def _delete_llm_profile(self) -> None:
+        from . import llm_profiles
+        from .widgets import ConfirmDialog
+
+        box = getattr(self, "llm_profile_select", None)
+        if box is None or box.currentData() is None:
+            return
+        pid = int(box.currentData())
+        name = box.currentText()
+        dialog = ConfirmDialog(
+            self, title="删除 API 配置",
+            message="删除「%s」？\n\n只删这套配置（地址 / 模型 / Key），"
+                    "对话记录和日程都不受影响。" % name,
+            confirm_text="删除", danger=True)
+        if dialog.exec() != ConfirmDialog.DialogCode.Accepted:
+            return
+        try:
+            ok = llm_profiles.delete_profile(self.store, pid)
+        except Exception as exc:  # noqa: BLE001
+            self.notify.emit("删除失败：%s" % exc)
+            return
+        if not ok:
+            self.notify.emit("至少要保留一套配置，删不了最后一套")
+            return
+        self._reload_llm_profiles()
+        profile = llm_profiles.active(self.store)
+        if profile is not None:
+            for attr, value in (("llm_base_edit", profile.get("base_url")),
+                                ("llm_model_name_edit", profile.get("model"))):
+                widget = getattr(self, attr, None)
+                if widget is not None:
+                    widget.setText(str(value or ""))
+        self.notify.emit("已删除，当前用「%s」" % (box.currentText() or ""))
+
+    def _save_llm_settings(self, sync_name: bool = True) -> None:
         try:
             values = self._collect_llm_settings()
             self.store.update_settings(values)
             key = self.llm_api_edit.text().strip()
             if key:
                 self.store.set_secret("llm_api_key", key)
+            # 面板上可能刚把「模型名 / 地址」改成别的：同步进当前这套配置
+            from . import llm_profiles
+
+            name_edit = getattr(self, "llm_profile_name_edit", None)
+            name = name_edit.text().strip() if (sync_name and name_edit is not None) else ""
+            llm_profiles.sync_from_legacy(self.store, name)
+            if key:
+                # 刚填的 Key：清掉输入框，灰字换成「已保存（不可查看）」
+                try:
+                    self.llm_api_edit.clear()
+                except Exception:
+                    pass
+            self._refresh_key_placeholder()
         except Exception:
             pass
 
@@ -1973,7 +3334,7 @@ class SettingsPage(QWidget):
             from PySide6.QtCore import QUrl
             from PySide6.QtGui import QDesktopServices
 
-            QDesktopServices.openUrl(QUrl(url))
+            open_external(url)
         except Exception:
             pass
 
@@ -2024,8 +3385,176 @@ class SettingsPage(QWidget):
         self.prompt_status.setObjectName("Tiny")
         self.prompt_status.setWordWrap(True)
         card.body.addWidget(self.prompt_status)
+
+        # ---------------- 每次发送前补「时间 + IP」
+        ctx_row = QHBoxLayout()
+        ctx_row.setSpacing(10)
+        ctx_text = QVBoxLayout()
+        ctx_text.setSpacing(2)
+        ctx_label = QLabel("在系统提示词最前面加上「今天的日期 + 本机 IP」")
+        ctx_label.setStyleSheet(f"color: {TEXT}; font-size: 10pt; font-weight: 600;")
+        ctx_desc = QLabel("每次发请求都现算（日期不会过期）；公网 IP 要联网查，默认不开")
+        ctx_desc.setObjectName("Tiny")
+        ctx_desc.setWordWrap(True)
+        ctx_text.addWidget(ctx_label)
+        ctx_text.addWidget(ctx_desc)
+        ctx_row.addLayout(ctx_text, 1)
+        self.prompt_context_switch = ToggleSwitch(
+            (self.store.get_setting("prompt_prepend_context", "1") or "1") == "1")
+        self.prompt_context_switch.toggled.connect(self._on_prompt_context_toggled)
+        ctx_row.addWidget(self.prompt_context_switch)
+        card.body.addLayout(ctx_row)
+
+        public_row = QHBoxLayout()
+        public_row.setSpacing(10)
+        public_label = QLabel("顺便查公网 IP（需要联网，结果缓存 1 小时）")
+        public_label.setObjectName("Tiny")
+        public_row.addWidget(public_label, 1)
+        self.prompt_public_switch = ToggleSwitch(
+            (self.store.get_setting("prompt_public_ip", "0") or "0") == "1")
+        self.prompt_public_switch.toggled.connect(self._on_prompt_public_toggled)
+        public_row.addWidget(self.prompt_public_switch)
+        card.body.addLayout(public_row)
+
+        # ---------------- 高级：用程序生成提示词
+        gen_row = QHBoxLayout()
+        gen_row.setSpacing(10)
+        gen_text = QVBoxLayout()
+        gen_text.setSpacing(2)
+        gen_label = QLabel("用程序现场生成提示词（高级）")
+        gen_label.setStyleSheet(f"color: {TEXT}; font-size: 10pt; font-weight: 600;")
+        self.prompt_gen_desc = QLabel(
+            "指定一个 .py / .exe / .bat：程序从 stdin 读到一行 JSON 上下文"
+            "（时间、IP、主机名、模型……），把要追加的提示词写到 stdout。"
+            "C / C++ 编成 exe 也能用；超时或报错不影响聊天。")
+        self.prompt_gen_desc.setObjectName("Tiny")
+        self.prompt_gen_desc.setWordWrap(True)
+        gen_text.addWidget(gen_label)
+        gen_text.addWidget(self.prompt_gen_desc)
+        gen_row.addLayout(gen_text, 1)
+        self.prompt_gen_switch = ToggleSwitch(
+            (self.store.get_setting("prompt_gen_enabled", "0") or "0") == "1")
+        self.prompt_gen_switch.toggled.connect(self._on_prompt_gen_toggled)
+        gen_row.addWidget(self.prompt_gen_switch)
+        card.body.addLayout(gen_row)
+
+        gen_pick = HScrollRow(height=40, spacing=8)
+        self.prompt_gen_path = QLineEdit()
+        self.prompt_gen_path.setPlaceholderText("生成程序路径，例如 data/prompt_gen_example.py")
+        self.prompt_gen_path.setText(self.store.get_setting("prompt_gen_command", "") or "")
+        self.prompt_gen_path.setMinimumWidth(280)
+        gen_pick.addWidget(self.prompt_gen_path)
+        gen_browse = SoftButton("选择…", "ghost", height=32, min_width=76,
+                                point_size=8.6)
+        gen_browse.clicked.connect(self._pick_prompt_gen)
+        gen_pick.addWidget(gen_browse)
+        gen_save = SoftButton("保存", "primary", height=32, min_width=64,
+                              point_size=8.6)
+        gen_save.clicked.connect(self._save_prompt_gen)
+        gen_pick.addWidget(gen_save)
+        gen_test = SoftButton("试运行", "ghost", height=32, min_width=76,
+                              point_size=8.6)
+        gen_test.clicked.connect(self._test_prompt_gen)
+        gen_pick.addWidget(gen_test)
+        gen_sample = SoftButton("写个示例脚本", "ghost", height=32, min_width=112,
+                                point_size=8.6)
+        gen_sample.clicked.connect(self._write_prompt_gen_sample)
+        gen_pick.addWidget(gen_sample)
+        gen_pick.addStretch(1)
+        card.body.addWidget(gen_pick)
+
+        self.prompt_gen_status = QLabel("")
+        self.prompt_gen_status.setObjectName("Tiny")
+        self.prompt_gen_status.setWordWrap(True)
+        card.body.addWidget(self.prompt_gen_status)
+        self._refresh_prompt_gen_status()
+
         self._load_prompt_text()
         return card
+
+    # -------------------------------------------------- 时间 / IP / 生成程序
+    def _on_prompt_context_toggled(self, checked: bool) -> None:
+        self.store.set_setting("prompt_prepend_context", "1" if checked else "0")
+        self.prompt_status.setText(
+            "已开启：每次发送都会在系统提示词最前面写上今天的日期和本机 IP"
+            if checked else "已关闭：系统提示词里不再带日期与 IP")
+
+    def _on_prompt_public_toggled(self, checked: bool) -> None:
+        self.store.set_setting("prompt_public_ip", "1" if checked else "0")
+        self.prompt_status.setText(
+            "已开启：会顺带查一次公网 IP（缓存 1 小时）" if checked
+            else "已关闭：只写本机局域网 IP")
+
+    def _on_prompt_gen_toggled(self, checked: bool) -> None:
+        self.store.set_setting("prompt_gen_enabled", "1" if checked else "0")
+        self._refresh_prompt_gen_status()
+
+    def _pick_prompt_gen(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "选择提示词生成程序", "",
+            "程序 (*.py *.exe *.bat *.cmd);;Python (*.py);;所有文件 (*.*)")
+        if path:
+            self.prompt_gen_path.setText(path)
+            self._save_prompt_gen()
+
+    def _save_prompt_gen(self) -> None:
+        from . import prompt_gen
+
+        value = self.prompt_gen_path.text().strip()
+        prompt_gen.set_command(self.store, value)
+        self._refresh_prompt_gen_status()
+        self.prompt_gen_status.setStyleSheet(f"color: {SUCCESS};")
+        self.prompt_gen_status.setText("已保存生成程序：" + (value or "（空）"))
+
+    def _test_prompt_gen(self) -> None:
+        from . import prompt_gen
+
+        prompt_gen.set_command(self.store, self.prompt_gen_path.text().strip())
+        was_enabled = prompt_gen.enabled(self.store)
+        prompt_gen.set_enabled(self.store, True)
+        try:
+            text, error = prompt_gen.generate(self.store, {"scene": "test"})
+        finally:
+            prompt_gen.set_enabled(self.store, was_enabled)
+        if error:
+            self.prompt_gen_status.setStyleSheet(f"color: {DANGER};")
+            self.prompt_gen_status.setText(error)
+            return
+        self.prompt_gen_status.setStyleSheet(f"color: {SUCCESS};")
+        preview = text if len(text) <= 300 else text[:300] + "…"
+        self.prompt_gen_status.setText("生成成功，会追加到系统提示词里：\n" + preview)
+
+    def _write_prompt_gen_sample(self) -> None:
+        from . import prompt_gen
+
+        try:
+            path = prompt_gen.write_sample(self.store)
+        except prompt_gen.PromptGenError as exc:
+            self.prompt_gen_status.setStyleSheet(f"color: {DANGER};")
+            self.prompt_gen_status.setText(str(exc))
+            return
+        self.prompt_gen_path.setText(str(path))
+        prompt_gen.set_command(self.store, str(path))
+        self.prompt_gen_status.setStyleSheet(f"color: {SUCCESS};")
+        self.prompt_gen_status.setText(
+            f"示例已写到 {path}；点「试运行」看看输出，满意就打开开关。")
+
+    def _refresh_prompt_gen_status(self) -> None:
+        from . import prompt_gen
+
+        path = prompt_gen.command(self.store)
+        if not prompt_gen.enabled(self.store):
+            self.prompt_gen_status.setText("生成程序：未启用")
+            return
+        if not path:
+            self.prompt_gen_status.setText("生成程序：已启用，但还没选程序")
+            return
+        last_error = self.store.get_setting("prompt_gen_last_error", "") or ""
+        if last_error:
+            self.prompt_gen_status.setStyleSheet(f"color: {WARNING};")
+            self.prompt_gen_status.setText("上次生成有问题：" + last_error)
+        else:
+            self.prompt_gen_status.setText(f"生成程序：已启用（{path}）")
 
     @staticmethod
     def _prompt_options() -> List[tuple]:
@@ -2092,7 +3621,7 @@ class SettingsPage(QWidget):
             from PySide6.QtCore import QUrl
             from PySide6.QtGui import QDesktopServices
 
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(prompts.ensure())))
+            open_external(str(prompts.ensure()), local=True)
         except Exception:
             pass
 
@@ -2554,11 +4083,221 @@ class SettingsPage(QWidget):
             from PySide6.QtCore import QUrl
             from PySide6.QtGui import QDesktopServices
 
-            QDesktopServices.openUrl(QUrl(url))
+            open_external(url)
         except Exception:
             pass
 
     # -------------------------------------------------- 文献
+    # -------------------------------------------------- 仪表板数据来源
+    def _build_dashsrc_card(self) -> Card:
+        from . import dashboard
+
+        card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=12)
+        card.body.addLayout(self._section_head(
+            icons.INFO, "ehall 数据来源",
+            "仪表板上的校园卡、校车、刷锻、图书馆、待办、空教室都按这里的地址取数",
+        ))
+        tip = QLabel(
+            "用法：在「eHall」页里登录一次，进到对应服务（比如空闲教室查询），"
+            "把地址栏的地址复制到下面这一栏，保存，然后回仪表板点「同步 ehall」。"
+            "留空的项就不同步。取到的是那个页面上的内容，登录态和 eHall 网页共用。")
+        tip.setObjectName("Tiny")
+        tip.setWordWrap(True)
+        tip.setStyleSheet(f"color: {MUTED};")
+        card.body.addWidget(tip)
+
+        self._ehall_url_edits = {}
+        for spec in dashboard.EHALL_CARDS:
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            name = QLabel(spec["title"])
+            name.setFixedWidth(104)
+            name.setStyleSheet(f"color: {TEXT}; font-size: 10pt;")
+            row.addWidget(name)
+            edit = QLineEdit()
+            edit.setPlaceholderText(str(spec.get("hint") or "这个服务的页面地址"))
+            edit.setFixedHeight(32)
+            try:
+                edit.setText(dashboard.source_url(self.store, spec["id"]))
+            except Exception:
+                pass
+            self._ehall_url_edits[spec["id"]] = edit
+            row.addWidget(edit, 1)
+            go = SoftButton("去 eHall", "ghost", height=30, min_width=76,
+                            point_size=8.4)
+            go.clicked.connect(lambda _=False, cid=spec["id"]: self._goto_service(cid))
+            row.addWidget(go)
+            card.body.addLayout(row)
+
+        divider = QWidget()
+        divider.setFixedHeight(1)
+        divider.setStyleSheet(f"background: {BORDER};")
+        card.body.addWidget(divider)
+
+        bus_row = QHBoxLayout()
+        bus_row.setSpacing(10)
+        bus_label = QLabel("校车方向")
+        bus_label.setFixedWidth(104)
+        bus_label.setStyleSheet(f"color: {TEXT}; font-size: 10pt;")
+        bus_row.addWidget(bus_label)
+        directions = []
+        try:
+            directions = dashboard.bus_directions(self.store)
+        except Exception:
+            directions = []
+        self.bus_dir_edit_a = QLineEdit()
+        self.bus_dir_edit_a.setPlaceholderText("例如 邯郸 → 江湾")
+        self.bus_dir_edit_a.setFixedHeight(32)
+        self.bus_dir_edit_b = QLineEdit()
+        self.bus_dir_edit_b.setPlaceholderText("例如 江湾 → 邯郸")
+        self.bus_dir_edit_b.setFixedHeight(32)
+        if len(directions) > 0:
+            self.bus_dir_edit_a.setText(directions[0])
+        if len(directions) > 1:
+            self.bus_dir_edit_b.setText(directions[1])
+        bus_row.addWidget(self.bus_dir_edit_a, 1)
+        bus_row.addWidget(self.bus_dir_edit_b, 1)
+        card.body.addLayout(bus_row)
+
+        # 空教室：教学楼列表（仪表板那个组件先选楼、再选教室）
+        room_row = QHBoxLayout()
+        room_row.setSpacing(10)
+        room_label = QLabel("教学楼列表")
+        room_label.setFixedWidth(104)
+        room_label.setStyleSheet(f"color: {TEXT}; font-size: 10pt;")
+        room_row.addWidget(room_label)
+        self.building_edit = QLineEdit()
+        self.building_edit.setPlaceholderText(
+            "逗号分隔，例如：二教, 三教, 四教, 五教, 六教, 光华西, 江湾")
+        self.building_edit.setFixedHeight(32)
+        self.building_edit.setToolTip(
+            "仪表板「空教室」组件里「教学楼」下拉的选项；留空就用默认那一套")
+        try:
+            self.building_edit.setText(
+                ", ".join(dashboard.empty_room_buildings(self.store)))
+        except Exception:
+            pass
+        room_row.addWidget(self.building_edit, 1)
+        card.body.addLayout(room_row)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        save = SoftButton("保存", "primary", height=34, min_width=92,
+                          point_size=8.8)
+        save.clicked.connect(self._save_dashboard_sources)
+        buttons.addWidget(save)
+        copy_button = SoftButton("看抓到的原文", "ghost", height=34, min_width=116,
+                                 point_size=8.8)
+        copy_button.clicked.connect(self._refresh_ehall_debug)
+        buttons.addWidget(copy_button)
+        buttons.addStretch(1)
+        card.body.addLayout(buttons)
+
+        self.dashboard_status = QLabel("")
+        self.dashboard_status.setObjectName("Tiny")
+        self.dashboard_status.setWordWrap(True)
+        card.body.addWidget(self.dashboard_status)
+
+        self.ehall_debug_label = QLabel("")
+        self.ehall_debug_label.setObjectName("Tiny")
+        self.ehall_debug_label.setWordWrap(True)
+        self.ehall_debug_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.ehall_debug_label.setStyleSheet(f"color: {MUTED};")
+        card.body.addWidget(self.ehall_debug_label)
+        return card
+
+    def _refresh_dashsrc_edits(self) -> None:
+        """把地址输入框和校车方向按设置里的当前值重填一遍。"""
+        from . import dashboard
+
+        for card_id, edit in getattr(self, "_ehall_url_edits", {}).items():
+            try:
+                edit.setText(dashboard.source_url(self.store, card_id))
+            except Exception:
+                pass
+        try:
+            directions = dashboard.bus_directions(self.store)
+            self.bus_dir_edit_a.setText(directions[0] if directions else "")
+            self.bus_dir_edit_b.setText(directions[1] if len(directions) > 1 else "")
+        except Exception:
+            pass
+        try:
+            edit = getattr(self, "building_edit", None)
+            if edit is not None:
+                edit.setText(", ".join(dashboard.empty_room_buildings(self.store)))
+        except Exception:
+            pass
+
+    def _goto_service(self, card_id: str) -> None:
+        """从设置里直接跳去 eHall（打开当前填的地址，或 ehall 首页）。"""
+        from . import dashboard
+
+        window = self.window()
+        navigate = getattr(window, "navigate", None)
+        if not callable(navigate):
+            return
+        url = ""
+        edit = getattr(self, "_ehall_url_edits", {}).get(card_id)
+        if edit is not None:
+            url = (edit.text() or "").strip()
+        url = url or dashboard.EHALL_HOME
+        navigate(5)
+        try:
+            window.ehall_page.web.load(url)
+        except Exception:
+            pass
+
+    def _save_dashboard_sources(self) -> None:
+        from . import dashboard
+
+        for card_id, edit in getattr(self, "_ehall_url_edits", {}).items():
+            url = (edit.text() or "").strip()
+            try:
+                self.store.set_setting("ehall_json_%s" % card_id, url)
+            except Exception:
+                pass
+        try:
+            dashboard.set_bus_directions(self.store, [
+                (self.bus_dir_edit_a.text() or "").strip(),
+                (self.bus_dir_edit_b.text() or "").strip(),
+            ])
+        except Exception:
+            pass
+        try:
+            building_edit = getattr(self, "building_edit", None)
+            if building_edit is not None:
+                raw = (building_edit.text() or "").replace("，", ",")
+                dashboard.set_empty_room_buildings(
+                    self.store, [item.strip() for item in raw.split(",")
+                                 if item.strip()])
+        except Exception:
+            pass
+        self.dashboard_status.setText("已保存。回仪表板点「同步 ehall」就能取数了。")
+        window = self.window()
+        page = getattr(window, "dashboard_page", None)
+        if page is not None:
+            try:
+                page.refresh()
+            except Exception:
+                pass
+
+    def _refresh_ehall_debug(self) -> None:
+        from . import dashboard, ehall_bridge
+
+        lines = []
+        for spec in dashboard.EHALL_CARDS:
+            cached = ehall_bridge.cache_get(self.store, spec["id"]) or {}
+            age = ehall_bridge.cache_age_text(self.store, spec["id"])
+            head = "【%s】%s" % (spec["title"], age or "还没同步")
+            lines.append(head)
+            if cached.get("error"):
+                lines.append("    问题：%s" % cached["error"])
+            sample = str(cached.get("text") or "").strip()
+            if sample:
+                lines.append("    原文：%s" % sample[:280].replace("\n", " "))
+        self.ehall_debug_label.setText("\n".join(lines) or "还没有抓到任何内容。")
+
     def _build_refs_card(self) -> Card:
         from . import refs
 
@@ -2712,7 +4451,7 @@ class SettingsPage(QWidget):
             else "已切回不透明窗口（内嵌网页才能点），重启后生效")
 
     def _on_browser_tabs_toggled(self, checked: bool) -> None:
-        """多标签页开关：下次启动生效（要重建浏览器控件）。"""
+        """多标签页开关：当场套到每个网页面板上（网页不会重新加载）。"""
         self.store.set_setting("browser_tabs", "1" if checked else "0")
         try:
             from . import web_panel
@@ -2720,9 +4459,8 @@ class SettingsPage(QWidget):
             web_panel.set_tabs_enabled(bool(checked))
         except Exception:
             pass
-        self.notify.emit(
-            "多标签页已开启，重新打开软件后生效" if checked
-            else "多标签页已关闭，重新打开软件后生效")
+        self.notify.emit("多标签页已开启：作业 / eHall / AI 网页顶部多了一排标签"
+                         if checked else "多标签页已关闭（只留一个网页）")
 
     def _focus_minutes(self) -> int:
         try:
@@ -2730,6 +4468,42 @@ class SettingsPage(QWidget):
         except Exception:
             value = 5
         return max(1, min(120, value))
+
+    def _build_tray_card(self) -> Card:
+        """窗口行为：点关闭是「收进托盘」还是「直接退出」。"""
+        card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=14)
+        card.body.addLayout(self._section_head(
+            icons.SWAP, "窗口行为",
+            "点右上角「关闭」时收进系统托盘；要真退出就右键托盘图标选「退出 DanLume」",
+        ))
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+        title = QLabel("关闭时收进托盘")
+        title.setStyleSheet(f"color: {TEXT}; font-size: 10pt; font-weight: 600;")
+        desc = QLabel("关闭后程序仍在后台（提醒、通知监控照常）；"
+                      "右键托盘图标可以「显示主窗口 / 退出」")
+        desc.setObjectName("Tiny")
+        desc.setWordWrap(True)
+        text_box.addWidget(title)
+        text_box.addWidget(desc)
+        row.addLayout(text_box, 1)
+        self.tray_switch = ToggleSwitch(
+            (self.store.get_setting("tray_on_close", "1") or "1") == "1")
+        self.tray_switch.toggled.connect(self._on_tray_toggled)
+        row.addWidget(self.tray_switch)
+        card.body.addLayout(row)
+        return card
+
+    def _on_tray_toggled(self, checked: bool) -> None:
+        try:
+            self.store.set_setting("tray_on_close", "1" if checked else "0")
+        except Exception:
+            return
+        self.notify.emit(
+            "关闭时会收进托盘，右键托盘图标可以退出"
+            if checked else "关闭窗口就直接退出程序")
 
     def _build_reminder_card(self) -> Card:
         card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=14)
@@ -2750,6 +4524,7 @@ class SettingsPage(QWidget):
         text_box.addWidget(desc)
         row.addLayout(text_box, 1)
         self.reminder_switch = ToggleSwitch(True)
+        self.reminder_switch.toggled.connect(self._apply_switches_now)
         row.addWidget(self.reminder_switch)
         card.body.addLayout(row)
 
@@ -2769,6 +4544,7 @@ class SettingsPage(QWidget):
         text_box2.addWidget(sound_desc)
         sound_row.addLayout(text_box2, 1)
         self.sound_switch = ToggleSwitch(True)
+        self.sound_switch.toggled.connect(self._apply_switches_now)
         sound_row.addWidget(self.sound_switch)
         card.body.addLayout(sound_row)
 
@@ -2783,9 +4559,36 @@ class SettingsPage(QWidget):
         text_box3.addWidget(auto_desc)
         auto_row.addLayout(text_box3, 1)
         self.auto_done_switch = ToggleSwitch(True)
+        self.auto_done_switch.toggled.connect(self._apply_switches_now)
         auto_row.addWidget(self.auto_done_switch)
         card.body.addLayout(auto_row)
         return card
+
+    def _apply_switches_now(self, *_args) -> None:
+        """提醒 / 提示音 / 过期自动完成：拨一下就生效，不用再点「保存设置」。
+
+        注意只在**值真的变了**的时候才通知外面，否则 `refresh()` 回填开关时
+        会再触发一次、外面刷新又回填，来回打转。
+        """
+        if not all(hasattr(self, name) for name in
+                   ("reminder_switch", "sound_switch", "auto_done_switch")):
+            return
+        wanted = {
+            "reminders_enabled": "1" if self.reminder_switch.isChecked() else "0",
+            "reminder_sound": "1" if self.sound_switch.isChecked() else "0",
+            "auto_done_enabled": "1" if self.auto_done_switch.isChecked() else "0",
+        }
+        try:
+            changed = any((self.store.get_setting(key, "") or "") != value
+                          for key, value in wanted.items())
+            self.store.update_settings(wanted)
+        except Exception:
+            return
+        if changed:
+            try:
+                self.settings_saved.emit()
+            except Exception:
+                pass
 
     # -------------------------------------------------- 定位与出发提醒
     # -------------------------------------------------- 目录
@@ -3101,7 +4904,7 @@ class SettingsPage(QWidget):
         row.addWidget(open_button)
         card.body.addLayout(row)
         about = QLabel(
-            f"Lumina v{APP_VERSION} · 本地优先的日程与工作汇报助手。"
+            f"DanLume v{APP_VERSION} · 本地优先的日程与工作汇报助手。"
             "邮件通过你配置的 SMTP 服务器直接发送，不经过任何第三方服务。"
         )
         about.setObjectName("Tiny")
@@ -3222,8 +5025,25 @@ class SettingsPage(QWidget):
         self.notify.emit("分组已删除，组内日程改为无分组")
 
     # -------------------------------------------------- 数据加载 / 保存
+    def showEvent(self, event):
+        # 每次打开设置都把「账户与登录」卡片刷新一遍（登录状态可能刚变）
+        try:
+            self._refresh_account_card()
+        except Exception:
+            pass
+        try:
+            self._refresh_grant_label()
+        except Exception:
+            pass
+        super().showEvent(event)
+
     def refresh(self) -> None:
         store = self.store
+        try:
+            self._refresh_grant_label()
+        except Exception:
+            pass
+        self._refresh_account_card()
         self._accounts = accounts.load(store)
         self._active_account = accounts.active_id(store)
         self._refresh_account_select()

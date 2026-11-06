@@ -1,25 +1,31 @@
 """日历页：自绘月视图 + 当日日程列表。"""
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QDate, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QDate, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from . import icons, theme
-from .config import WEEKDAY_SHORT
+from .config import PERIOD_TIMES, WEEKDAY_SHORT
 from .theme import (
-    ACCENT, ACCENT2, BORDER, CARD, CARD_ALT, DANGER, FAINT, MUTED, SUCCESS, TEXT,
-    TEXT_SOFT,
+    ACCENT, ACCENT2, BORDER, BORDER_SOFT, CARD, CARD_ALT, DANGER, FAINT, MUTED,
+    SUCCESS, TEXT, TEXT_SOFT,
 )
 from .utils import date_short_cn, event_range, iso, month_label, relative_label, weekday_cn
 from .widgets import (
     Card, ConfirmDialog, ElidedLabel, EmptyState, IconButton, Pill, RoundCheck,
     SoftButton, clear_layout, make_scroll,
 )
+
+
+def _monday_of(day: QDate) -> QDate:
+    """这一周的周一。"""
+    return QDate(day).addDays(1 - int(day.dayOfWeek()))
 
 
 def _grid_start(month_first: QDate) -> QDate:
@@ -275,6 +281,410 @@ def _event_color(key: Optional[str]) -> str:
     return theme.event_base(str(key))
 
 
+class WeekGrid(QWidget):
+    """周视图：行=节次（1–14），列=周一到周日，日程按时间落格子。
+
+    比手机端多显示细节：标题、地点、起止时间、分组颜色条；跨节次的日程会占多行。
+    """
+
+    dateSelected = Signal(QDate)
+    dateActivated = Signal(QDate)
+    eventActivated = Signal(int)
+
+    HEADER = 44
+    TIME_COL = 62
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._monday = _monday_of(QDate.currentDate())
+        self._selected = QDate.currentDate()
+        self._events: Dict[str, List[Dict[str, Any]]] = {}
+        self._periods = [tuple(item) for item in PERIOD_TIMES]
+        self.setMinimumHeight(520)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    # -------------------------------------------------- 状态
+    def set_week(self, monday: QDate) -> None:
+        self._monday = _monday_of(monday)
+        self.update()
+
+    def set_selected(self, value: QDate) -> None:
+        if value.isValid():
+            self._selected = QDate(value)
+            self.update()
+
+    def set_events(self, index: Dict[str, List[Dict[str, Any]]]) -> None:
+        self._events = index or {}
+        self.update()
+
+    def set_periods(self, periods) -> None:
+        self._periods = [tuple(item) for item in (periods or PERIOD_TIMES)]
+        self.update()
+
+    def monday(self) -> QDate:
+        return QDate(self._monday)
+
+    # -------------------------------------------------- 几何
+    def _col_width(self) -> float:
+        return max(1.0, (self.width() - self.TIME_COL) / 7.0)
+
+    def _row_height(self) -> float:
+        return max(1.0, (self.height() - self.HEADER) / max(1, len(self._periods)))
+
+    def _day_at(self, pos) -> Optional[QDate]:
+        if pos.x() < self.TIME_COL or pos.y() < self.HEADER:
+            return None
+        column = int((pos.x() - self.TIME_COL) // self._col_width())
+        if not 0 <= column < 7:
+            return None
+        return self._monday.addDays(column)
+
+    def _period_at(self, pos) -> Optional[int]:
+        if pos.y() < self.HEADER:
+            return None
+        row = int((pos.y() - self.HEADER) // self._row_height())
+        if 0 <= row < len(self._periods):
+            return row
+        return None
+
+    @staticmethod
+    def _minutes(text: str) -> Optional[int]:
+        try:
+            hour, minute = str(text or "").strip()[:5].split(":")
+            return int(hour) * 60 + int(minute)
+        except Exception:
+            return None
+
+    def _rows_for(self, event: Dict[str, Any]) -> tuple:
+        """把一条日程换成 (起始行, 跨几行)。
+
+        节次之间有课间空档（例如第 8 节 15:25–16:10、第 9 节 16:20–17:05），
+        「16:15 开始的日程」不落在任何一节**内部**。所以这里不能用
+        「开始时间在某节之内」来判行，而是：
+        * 起始行 = **第一个还没结束的节次**（finish > start）；
+        * 结束行 = **最后一个已经开始的节次**（begin < end）。
+        以前用「包含」判断，遇到空档里的时间 first 会是 None，被兜到第 1 行，
+        于是下午 16:15 的日程画在了早上第 1 行 —— 用户看到的「时间对不上」就是这个。
+        """
+        start = self._minutes(event.get("start_time"))
+        end = self._minutes(event.get("end_time"))
+        if start is None:
+            return 0, 1
+        spans = []
+        for index, (number, begin, finish) in enumerate(self._periods):
+            begin_min = self._minutes(begin)
+            finish_min = self._minutes(finish)
+            if begin_min is None:
+                begin_min = 0
+            if finish_min is None:
+                finish_min = begin_min + 45
+            spans.append((index, begin_min, finish_min))
+
+        first = None
+        for index, begin_min, finish_min in spans:
+            if finish_min > start:
+                first = index
+                break
+        if first is None:
+            first = len(spans) - 1          # 比最后一节还晚：贴最后一行
+
+        last = first
+        if end is not None:
+            for index, begin_min, finish_min in spans:
+                if begin_min < end:
+                    last = index
+                else:
+                    break
+            last = max(first, last)
+        return first, last - first + 1
+
+    # -------------------------------------------------- 绘制
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor(CARD))
+        column_width = self._col_width()
+        row_height = self._row_height()
+        today = QDate.currentDate()
+
+        # 表头：周一…周日 + 日期
+        head_font = QFont(self.font())
+        head_font.setPointSizeF(9.0)
+        head_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(head_font)
+        for column in range(7):
+            day = self._monday.addDays(column)
+            x = self.TIME_COL + column * column_width
+            is_today = day == today
+            if is_today:
+                painter.fillPath(
+                    _rounded(QRectF(x + 4, 4, column_width - 8, self.HEADER - 8), 10),
+                    theme.appearance().accent_q(0.12))
+            painter.setPen(QColor(theme.appearance().accent if is_today else MUTED))
+            painter.drawText(QRectF(x, 6, column_width, 18),
+                             int(Qt.AlignmentFlag.AlignCenter), WEEKDAY_SHORT[column])
+            date_font = QFont(head_font)
+            date_font.setPointSizeF(8.2)
+            painter.setFont(date_font)
+            painter.setPen(QColor(theme.appearance().accent if is_today else TEXT_SOFT))
+            painter.drawText(QRectF(x, 22, column_width, 18),
+                             int(Qt.AlignmentFlag.AlignCenter),
+                             "%d/%d" % (day.month(), day.day()))
+            painter.setFont(head_font)
+
+        # 时间列 + 网格线
+        time_font = QFont(self.font())
+        time_font.setPointSizeF(7.8)
+        for row, (number, begin, finish) in enumerate(self._periods):
+            y = self.HEADER + row * row_height
+            painter.setPen(QPen(QColor(BORDER_SOFT), 1.0))
+            painter.drawLine(QPointF(self.TIME_COL, y), QPointF(self.width(), y))
+            painter.setFont(time_font)
+            painter.setPen(QColor(MUTED))
+            painter.drawText(QRectF(4, y + 2, 22, 16),
+                             int(Qt.AlignmentFlag.AlignCenter), str(number))
+            painter.setPen(QColor(FAINT if theme.is_dark() else MUTED))
+            # 时间列：行高够就分两行写起止时间，太挤时只写开始时间
+            line_height = QFontMetrics(time_font).height()
+            room = row_height - 6
+            if room >= line_height * 2:
+                painter.drawText(QRectF(24, y + 2, self.TIME_COL - 26, room),
+                                 int(Qt.AlignmentFlag.AlignLeft) |
+                                 int(Qt.AlignmentFlag.AlignTop),
+                                 "%s\n%s" % (begin, finish))
+            else:
+                painter.drawText(QRectF(24, y + 2, self.TIME_COL - 26, 16),
+                                 int(Qt.AlignmentFlag.AlignLeft) |
+                                 int(Qt.AlignmentFlag.AlignVCenter), begin)
+
+        for column in range(1, 7):
+            x = self.TIME_COL + column * column_width
+            painter.setPen(QPen(QColor(BORDER_SOFT), 1.0))
+            painter.drawLine(QPointF(x, self.HEADER),
+                             QPointF(x, self.height()))
+
+        # 说明：这里**不再**给整列铺底色（以前铺的是选中列，用户会问「怎么周三有
+        # 浅色底色」）。现在「今天」只用表头那个圆角高亮 + 主题色日期，
+        # 选中那天用表头下面一根短横线，整列保持干净。
+        offset = self._monday.daysTo(self._selected)
+        if 0 <= offset < 7:
+            x = self.TIME_COL + offset * column_width
+            bar_width = min(26.0, column_width * 0.36)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(theme.appearance().accent_q(0.75))
+            painter.drawRoundedRect(
+                QRectF(x + (column_width - bar_width) / 2, self.HEADER - 7,
+                       bar_width, 3), 1.5, 1.5)
+
+        # 日程块
+        label_font = QFont(self.font())
+        label_font.setPointSizeF(8.6)
+        label_font.setWeight(QFont.Weight.DemiBold)
+        meta_font = QFont(self.font())
+        meta_font.setPointSizeF(7.6)
+        for column in range(7):
+            day = self._monday.addDays(column)
+            items = self._events.get(iso(day)) or []
+            layout = self._day_layout(
+                items, column_width, row_height,
+                left=self.TIME_COL + column * column_width)
+            for block_info in layout:
+                item = block_info["item"]
+                block = block_info["rect"]
+                width = block.width()
+                height = block.height()
+                x = block.left()
+                y = block.top()
+                if height < 24 or width < 18:
+                    continue
+                color = QColor(_event_color(item.get("color")))
+                soft, _hover, ink = theme.event_tint(str(item.get("color", "violet")))
+                done = bool(item.get("done"))
+                painter.fillPath(_rounded(block, 8), QColor(soft))
+                painter.setPen(QPen(QColor(theme.mix(ink, QColor(CARD), 0.82).name()), 1.0))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(_rounded(block, 8))
+                painter.fillPath(_rounded(QRectF(x, y, 3.5, height), 1.8), color)
+
+                inner = block.adjusted(7, 4, -3, -3)
+                narrow = width < 46
+                title = str(item.get("title") or "（未命名）")
+                title_font = QFont(label_font)
+                title_font.setStrikeOut(done)
+                painter.setFont(title_font)
+                painter.setPen(QColor("#9AA396" if done else theme.TEXT))
+                metrics = QFontMetrics(title_font)
+                title_rect = QRectF(inner.left(), inner.top(), inner.width(), 0)
+                text = title
+                if metrics.horizontalAdvance(text) > title_rect.width():
+                    while text and metrics.horizontalAdvance(text + "…") > title_rect.width():
+                        text = text[:-1]
+                    text = (text + "…") if text else "…"
+                detail_lines = 1
+                if height >= 46:
+                    detail_lines = 2
+                if height >= 64:
+                    detail_lines = 3
+                painter.drawText(QRectF(inner.left(), inner.top(), inner.width(),
+                                        metrics.height() * detail_lines),
+                                 int(Qt.AlignmentFlag.AlignLeft) |
+                                 int(Qt.AlignmentFlag.AlignTop) |
+                                 int(Qt.TextFlag.TextWordWrap),
+                                 text)
+                meta_top = inner.top() + metrics.height() * detail_lines + 2
+                painter.setFont(meta_font)
+                painter.setPen(QColor(theme.MUTED))
+                pieces = []
+                start_time = str(item.get("start_time") or "")[:5]
+                end_time = str(item.get("end_time") or "")[:5]
+                if start_time:
+                    pieces.append(f"{start_time}–{end_time}" if end_time else start_time)
+                location = str(item.get("location") or "").strip()
+                if location:
+                    pieces.append(location[:18])
+                remaining = inner.bottom() - meta_top
+                # 并排之后这一列可能很窄：宽度不够就别画时间，
+                # 不然会出现「08:0」「15:25–1」这种半截字
+                if (pieces and remaining >= 12 and not narrow
+                        and inner.width() >= 62):
+                    painter.drawText(
+                        QRectF(inner.left(), meta_top, inner.width(),
+                               min(remaining, QFontMetrics(meta_font).height() * 2)),
+                        int(Qt.AlignmentFlag.AlignLeft) |
+                        int(Qt.AlignmentFlag.AlignTop) |
+                        int(Qt.TextFlag.TextWordWrap), " · ".join(pieces))
+
+    # -------------------------------------------------- 冲突并列
+    def _day_layout(self, items: List[Dict[str, Any]], column_width: float,
+                    row_height: float, left: float = 0.0) -> List[Dict[str, Any]]:
+        """一天里时间冲突的日程**并排**显示，互相不覆盖。
+
+        * 先按行区间（`_rows_for` 的起止行）把「有交叠」的日程聚成一组；
+        * 组内按开始时间排，依次塞进第一个空着的「道」（lane）；
+        * 每组占满整列宽度，组内每条 = 列宽 / 道数（留一点缝）。
+        没有冲突的日程自然是一组一条，仍然是整宽 —— 跟以前一样。
+        """
+        blocks: List[Dict[str, Any]] = []
+        for item in items or []:
+            first, span = self._rows_for(item)
+            blocks.append({"item": item, "first": int(first), "span": int(span),
+                           "last": int(first) + max(1, int(span)) - 1})
+        if not blocks:
+            return []
+        blocks.sort(key=lambda row: (row["first"], row["last"]))
+
+        # ① 聚成「互相重叠」的组
+        groups: List[List[Dict[str, Any]]] = []
+        for block in blocks:
+            if groups and block["first"] <= max(
+                    item["last"] for item in groups[-1]):
+                groups[-1].append(block)
+            else:
+                groups.append([block])
+
+        # ② 组内分道
+        gap = 3.0
+        for group in groups:
+            lanes: List[int] = []          # 每道当前用到第几行
+            for block in sorted(group, key=lambda row: (row["first"],
+                                                        row["last"])):
+                placed = False
+                for index, lane_end in enumerate(lanes):
+                    if lane_end < block["first"]:
+                        lanes[index] = block["last"]
+                        block["lane"] = index
+                        placed = True
+                        break
+                if not placed:
+                    block["lane"] = len(lanes)
+                    lanes.append(block["last"])
+            count = max(1, len(lanes))
+            usable = max(24.0, column_width - 6.0)
+            width = max(18.0, (usable - gap * (count - 1)) / count)
+            for block in group:
+                block["width"] = width
+                block["count"] = count
+
+        result = []
+        for block in blocks:
+            x = float(left) + 3.0
+            lane = int(block.get("lane", 0))
+            width = float(block.get("width") or (column_width - 6))
+            rect = QRectF(x + lane * (width + gap),
+                          self.HEADER + block["first"] * row_height + 3,
+                          width,
+                          max(20.0, block["span"] * row_height - 6))
+            block["rect"] = rect
+            result.append(block)
+        return result
+
+    # -------------------------------------------------- 交互
+    def mousePressEvent(self, event):
+        day = self._day_at(event.position())
+        if day is None:
+            return
+        self._selected = QDate(day)
+        for item in self._events.get(iso(day)) or []:
+            hit = self._block_rect(day, item)
+            if hit is not None and hit.contains(event.position()):
+                try:
+                    self.eventActivated.emit(int(item.get("id") or 0))
+                except Exception:
+                    pass
+                break
+        self.dateSelected.emit(QDate(day))
+        self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        day = self._day_at(event.position())
+        if day is not None:
+            self.dateActivated.emit(QDate(day))
+
+    def mouseMoveEvent(self, event):
+        """冲突并排之后块会变窄，悬停给出完整信息（标题 · 时间 · 地点）。"""
+        day = self._day_at(event.position())
+        if day is None:
+            self.setToolTip("")
+            return
+        offset = max(0, self._monday.daysTo(day))
+        column_width = self._col_width()
+        layout = self._day_layout(
+            self._events.get(iso(day)) or [], column_width, self._row_height(),
+            left=self.TIME_COL + offset * column_width)
+        for block in layout:
+            if not block["rect"].contains(event.position()):
+                continue
+            item = block["item"]
+            bits = [str(item.get("title") or "")]
+            start = str(item.get("start_time") or "")[:5]
+            end = str(item.get("end_time") or "")[:5]
+            if start:
+                bits.append(f"{start}–{end}" if end else start)
+            if str(item.get("location") or "").strip():
+                bits.append(str(item.get("location")).strip())
+            self.setToolTip(" · ".join(bit for bit in bits if bit))
+            return
+        self.setToolTip("")
+
+    def _block_rect(self, day: QDate, item: Dict[str, Any]):
+        """点哪块算哪块 —— 冲突并列之后必须用同一份排版结果。"""
+        offset = self._monday.daysTo(day)
+        if not 0 <= offset < 7:
+            return None
+        items = self._events.get(iso(day)) or []
+        column_width = self._col_width()
+        layout = self._day_layout(
+            items, column_width, self._row_height(),
+            left=self.TIME_COL + offset * column_width)
+        for block in layout:
+            same_id = int(block["item"].get("id") or 0) == int(item.get("id") or 0)
+            if block["item"] is item or (
+                    same_id and block["item"].get("title") == item.get("title")):
+                return block["rect"]
+        return None
+
+
 class EventCard(Card):
     edit_requested = Signal(int)
     delete_requested = Signal(int)
@@ -312,6 +722,8 @@ class EventCard(Card):
         time_font.setWeight(QFont.Weight.DemiBold)
         time_label.setFont(time_font)
         time_label.setStyleSheet(f"color: {ink.name()}; background: transparent;")
+        self._time_label = time_label
+        self._ink = QColor(ink)
         top.addWidget(time_label)
         top.addStretch(1)
         self.check = RoundCheck(bool(event.get("done")), 20, tip="标记为完成")
@@ -340,6 +752,7 @@ class EventCard(Card):
             f"color: {'#9AA396' if done else TEXT}; background: transparent;"
             f" padding-right: 8px;"
         )
+        self._title_label = title
         layout.addWidget(title)
 
         description = str(event.get("description", "")).strip()
@@ -355,6 +768,7 @@ class EventCard(Card):
             desc_label.setStyleSheet(
                 f"color: {QColor(FAINT).name() if done else MUTED}; background: transparent;"
             )
+            self._desc_label = desc_label
             layout.addWidget(desc_label)
 
         chips = QHBoxLayout()
@@ -367,9 +781,39 @@ class EventCard(Card):
                             MUTED, "", point_size=7.8)
             chips.addWidget(reminder)
         if done:
-            chips.addWidget(Pill("已完成", SUCCESS, theme.soft(SUCCESS, 0.14), point_size=7.8))
+            self._done_pill = Pill("已完成", SUCCESS, theme.soft(SUCCESS, 0.14),
+                                   point_size=7.8)
+            chips.addWidget(self._done_pill)
         chips.addStretch(1)
         layout.addLayout(chips)
+
+    # -------------------------------------------------- 主题
+    def on_theme_changed(self) -> None:
+        """换主题后重算这张卡片的配色（柔和底色 / 描边 / 文字 / 小标签）。"""
+        data = self.event_data
+        key = str(data.get("color", "violet"))
+        soft, hover, ink = theme.event_tint(key)
+        self._ink = QColor(ink)
+        self._fill = QColor(soft)
+        self._hover_fill = QColor(hover)
+        self._border = QColor(theme.mix(ink, QColor(theme.CARD), 0.82).name())
+        self._bar = QColor(_event_color(key))
+        self._theme_rev = theme.revision()
+        done = bool(data.get("done"))
+        with suppress(Exception):
+            self._time_label.setStyleSheet(
+                f"color: {ink.name()}; background: transparent;")
+        with suppress(Exception):
+            self._title_label.setStyleSheet(
+                f"color: {'#9AA396' if done else TEXT}; background: transparent;"
+                f" padding-right: 8px;")
+        with suppress(Exception):
+            self._desc_label.setStyleSheet(
+                f"color: {QColor(FAINT).name() if done else MUTED};"
+                f" background: transparent;")
+        with suppress(Exception):
+            self._done_pill.set_colors(SUCCESS, theme.soft(SUCCESS, 0.14))
+        self.update()
 
     def _on_done(self, checked: bool) -> None:
         self.done_toggled.emit(int(self.event_data.get("id", 0)), bool(checked))
@@ -547,6 +991,13 @@ class CalendarPage(QWidget):
         today = QDate.currentDate()
         self._month = QDate(today.year(), today.month(), 1)
         self._selected = QDate(today)
+        self._view = "month"
+        self._week_monday = _monday_of(today)
+        try:
+            stored = str(store.get_setting("calendar_view", "month") or "month")
+            self._view = "week" if stored == "week" else "month"
+        except Exception:
+            self._view = "month"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 18, 26, 20)
@@ -566,10 +1017,10 @@ class CalendarPage(QWidget):
         header.addStretch(1)
 
         prev_button = IconButton(icons.CHEVRON_LEFT, size=32, glyph_size=11,
-                                 color=MUTED, tip="上个月")
+                                 color=MUTED, tip="上一页")
         prev_button.clicked.connect(lambda: self._shift_month(-1))
         next_button = IconButton(icons.CHEVRON_RIGHT, size=32, glyph_size=11,
-                                 color=MUTED, tip="下个月")
+                                 color=MUTED, tip="下一页")
         next_button.clicked.connect(lambda: self._shift_month(1))
         today_button = SoftButton("今天", "ghost", height=32, point_size=9.0)
         today_button.clicked.connect(self._go_today)
@@ -581,6 +1032,24 @@ class CalendarPage(QWidget):
         month_nav_row.addWidget(today_button)
         month_nav_row.addWidget(next_button)
         self._month_nav_host = month_nav_host
+
+        # 月 / 周 两种视图
+        view_host = QWidget()
+        view_row = QHBoxLayout(view_host)
+        view_row.setContentsMargins(0, 0, 0, 0)
+        view_row.setSpacing(4)
+        self.month_view_button = SoftButton("月", "ghost", height=32, min_width=48,
+                                            point_size=9.0)
+        self.month_view_button.setToolTip("月视图：整月的日历格")
+        self.month_view_button.clicked.connect(lambda: self.set_view("month"))
+        view_row.addWidget(self.month_view_button)
+        self.week_view_button = SoftButton("周", "ghost", height=32, min_width=48,
+                                           point_size=9.0)
+        self.week_view_button.setToolTip("周视图：按节次排的课程表，能看到每条日程的细节")
+        self.week_view_button.clicked.connect(lambda: self.set_view("week"))
+        view_row.addWidget(self.week_view_button)
+        self._view_host = view_host
+        header.addWidget(view_host)
         header.addWidget(month_nav_host)
         new_button = SoftButton("新建日程", "primary", glyph=icons.ADD, height=36,
                                 min_width=116)
@@ -624,8 +1093,27 @@ class CalendarPage(QWidget):
         content_host.setLayout(content)
         self._content_host = content_host
 
-        root.addWidget(content_host, 1)
+        # 周视图：一张卡片里放表格（行=节次，列=周一到周日）
+        week_card = Card(radius=18, fill=CARD, border=BORDER, padding=12, spacing=4)
+        self.week_grid = WeekGrid()
+        self.week_grid.set_week(self._week_monday)
+        self.week_grid.set_selected(self._selected)
+        self.week_grid.dateSelected.connect(self._on_date_selected)
+        self.week_grid.dateActivated.connect(self.new_event_requested)
+        self.week_grid.eventActivated.connect(self.view_event_requested)
+        week_card.body.addWidget(self.week_grid, 1)
+        week_hint = QLabel("点格子看当天日程 · 双击空白处新建 · 点日程块看详情")
+        week_hint.setObjectName("Tiny")
+        week_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        week_card.body.addWidget(week_hint)
+        self._week_card = week_card
+
+        self._view_stack = QStackedWidget()
+        self._view_stack.addWidget(content_host)
+        self._view_stack.addWidget(week_card)
+        root.addWidget(self._view_stack, 1)
         self.refresh()
+        self.set_view(self._view)
 
     # -------------------------------------------------- 导航
     def showEvent(self, event):
@@ -645,24 +1133,55 @@ class CalendarPage(QWidget):
             return
         self._selected = QDate(value)
         self._month = QDate(value.year(), value.month(), 1)
+        self._week_monday = _monday_of(value)
+        self.refresh()
+
+    def view(self) -> str:
+        """当前是月视图还是周视图。"""
+        return getattr(self, "_view", "month")
+
+    def set_view(self, kind: str) -> None:
+        """切换月 / 周视图（记住选择）。"""
+        self._view = "week" if str(kind) == "week" else "month"
+        try:
+            self.store.set_setting("calendar_view", self._view)
+        except Exception:
+            pass
+        try:
+            self._view_stack.setCurrentIndex(1 if self._view == "week" else 0)
+            self.month_view_button.setKind(
+                "primary" if self._view == "month" else "ghost")
+            self.week_view_button.setKind(
+                "primary" if self._view == "week" else "ghost")
+        except Exception:
+            pass
         self.refresh()
 
     def _shift_month(self, delta: int) -> None:
+        if self.view() == "week":
+            self._week_monday = self._week_monday.addDays(7 * int(delta))
+            self._selected = self._selected.addDays(7 * int(delta))
+            self._month = QDate(self._selected.year(), self._selected.month(), 1)
+            self.refresh()
+            return
         target = self._month.addMonths(delta)
         day = min(self._selected.day(), target.daysInMonth())
         self._month = QDate(target.year(), target.month(), 1)
         self._selected = QDate(target.year(), target.month(), day)
+        self._week_monday = _monday_of(self._selected)
         self.refresh()
 
     def _go_today(self) -> None:
         today = QDate.currentDate()
         self._month = QDate(today.year(), today.month(), 1)
         self._selected = QDate(today)
+        self._week_monday = _monday_of(today)
         self.refresh()
 
     def _on_date_selected(self, value: QDate) -> None:
         self._selected = QDate(value)
         self._month = QDate(value.year(), value.month(), 1)
+        self._week_monday = _monday_of(value)
         self.refresh()
 
     def _on_data_changed(self) -> None:
@@ -767,6 +1286,19 @@ class CalendarPage(QWidget):
         self.grid.set_selected(self._selected)
         self.grid.set_events(index)
 
+        # 周视图：按这一周（周一→周日）取日程
+        try:
+            week_start = self._week_monday
+            week_end = week_start.addDays(6)
+            week_index = apply_group_colors(
+                self.store,
+                self.store.event_index(iso(week_start), iso(week_end)))
+            self.week_grid.set_week(week_start)
+            self.week_grid.set_selected(self._selected)
+            self.week_grid.set_events(week_index)
+        except Exception:
+            pass
+
         month_start, month_end = _month_range(self._month)
         # 课程表是「上课时间」不是待办，不计入本月日程总数
         excluded = []
@@ -779,18 +1311,43 @@ class CalendarPage(QWidget):
         except Exception:
             excluded = []
         counts = self.store.counts_between(month_start, month_end, excluded)
-        self.month_title.setText(month_label(self._month))
-        if counts["total"]:
-            self.month_sub.setText(
-                f"本月 {counts['total']} 个日程 · 已完成 {counts['done']} 个"
-            )
+        if self.view() == "week":
+            self._update_week_header()
         else:
-            self.month_sub.setText("本月还没有日程，双击日历空白日期开始规划")
+            self.month_title.setText(month_label(self._month))
+            if counts["total"]:
+                self.month_sub.setText(
+                    f"本月 {counts['total']} 个日程 · 已完成 {counts['done']} 个"
+                )
+            else:
+                self.month_sub.setText("本月还没有日程，双击日历空白日期开始规划")
 
         self.day_panel.set_date(self._selected)
         if getattr(self, "_compact", False):
             self._refresh_compact()
         self.refresh_countdown()
+
+    def _update_week_header(self) -> None:
+        """周视图的标题：第几周 + 日期区间 + 本周日程数。"""
+        start = self._week_monday
+        end = start.addDays(6)
+        try:
+            week_number = start.weekNumber()[0]
+        except Exception:
+            week_number = 0
+        self.month_title.setText("第 %d 周" % week_number)
+        counts = {"total": 0, "done": 0}
+        try:
+            counts = self.store.counts_between(iso(start), iso(end))
+        except Exception:
+            pass
+        span = "%d/%d – %d/%d" % (start.month(), start.day(), end.month(), end.day())
+        if counts.get("total"):
+            self.month_sub.setText(
+                "%s · 本周 %d 个日程 · 已完成 %d 个"
+                % (span, counts["total"], counts.get("done", 0)))
+        else:
+            self.month_sub.setText("%s · 本周还没有日程" % span)
 
     # -------------------------------------------------- 重要日倒计时
     def open_important(self, title: str = "", day: str = "") -> None:

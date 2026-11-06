@@ -1,8 +1,11 @@
-"""AI 面板：三个标签页 —— 系统提示词 / WebUI 对话 / API 服务。
+"""AI 面板：三个标签页 —— API 服务 / WebUI 对话 / 系统提示词。
 
-* 系统提示词：就地编辑 data/prompts.json 里的提示词，保存即生效；
+顺序按使用频率排（用户要求）：默认停在 **API 服务**，其次 WebUI 网页对话，
+最后才是系统提示词（偶尔调一次）。
+
+* API 服务：内置的流式对话窗口（不加载网页），走 OpenAI 兼容接口；
 * WebUI 对话：内嵌 DeepSeek / 豆包 / Kimi / 自定义站点（用网页，登录态保留）；
-* API 服务：内置的流式对话窗口（不加载网页），走 OpenAI 兼容接口。
+* 系统提示词：就地编辑 data/prompts.json 里的提示词，保存即生效。
 
 设置项：ai_service、ai_custom_sites、ai_local_sites（都是 JSON 列表）
 """
@@ -19,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from . import theme
 from .web_panel import EmbeddedWebPanel
-from .widgets import Select, SoftButton
+from .widgets import HScrollRow, Select, SoftButton
 
 SERVICE_KEY = "ai_service"
 CUSTOM_KEY = "ai_custom_sites"
@@ -27,9 +30,10 @@ LOCAL_KEY = "ai_local_sites"
 ADD_CUSTOM = "__add_custom__"
 ADD_LOCAL = "__add_local__"
 
-TAB_PROMPT = 0
+#: 标签顺序 = 页面顺序：API 服务（默认）→ WebUI 对话 → 系统提示词
+TAB_API = 0
 TAB_WEBUI = 1
-TAB_API = 2
+TAB_PROMPT = 2
 
 SERVICES: List[Tuple[str, str, str]] = [
     ("deepseek", "DeepSeek", "https://chat.deepseek.com/"),
@@ -83,7 +87,7 @@ class AiPage(QWidget):
         self._local = _load_sites(store, LOCAL_KEY)
         self._service = (store.get_setting(SERVICE_KEY, "deepseek")
                          or "deepseek").strip()
-        self._tab = TAB_PROMPT
+        self._tab = TAB_API
 
         root = QVBoxLayout(self)
         if self._compact:
@@ -93,23 +97,23 @@ class AiPage(QWidget):
         root.setSpacing(8 if self._compact else 10)
 
         # -------------------------------------------------- 顶部：三个标签
-        header = QHBoxLayout()
-        header.setSpacing(6)
-        self.prompt_tab = SoftButton("系统提示词", "primary", height=28,
-                                     min_width=92, point_size=8.4)
-        self.prompt_tab.setToolTip("调整 AI 的人设与场景提示词")
-        self.prompt_tab.clicked.connect(lambda: self.set_tab(TAB_PROMPT))
-        header.addWidget(self.prompt_tab)
+        # 分栏变窄时这一排放不下 → 横向滚动，而不是叠在一起
+        header = HScrollRow(height=34, spacing=6)
+        self.api_tab = SoftButton("API 服务", "primary", height=28,
+                                  min_width=88, point_size=9.4)
+        self.api_tab.setToolTip("用接口 Key 的内置流式对话窗口（默认）")
+        self.api_tab.clicked.connect(lambda: self.set_tab(TAB_API))
+        header.addWidget(self.api_tab)
         self.webui_tab = SoftButton("WebUI 对话", "ghost", height=28,
-                                    min_width=92, point_size=8.4)
+                                    min_width=96, point_size=9.4)
         self.webui_tab.setToolTip("内嵌 DeepSeek / 豆包 / Kimi 网页")
         self.webui_tab.clicked.connect(lambda: self.set_tab(TAB_WEBUI))
         header.addWidget(self.webui_tab)
-        self.api_tab = SoftButton("API 服务", "ghost", height=28,
-                                  min_width=84, point_size=8.4)
-        self.api_tab.setToolTip("用接口 Key 的内置流式对话窗口")
-        self.api_tab.clicked.connect(lambda: self.set_tab(TAB_API))
-        header.addWidget(self.api_tab)
+        self.prompt_tab = SoftButton("系统提示词", "ghost", height=28,
+                                     min_width=96, point_size=9.4)
+        self.prompt_tab.setToolTip("调整 AI 的人设与场景提示词")
+        self.prompt_tab.clicked.connect(lambda: self.set_tab(TAB_PROMPT))
+        header.addWidget(self.prompt_tab)
         header.addStretch(1)
 
         self.service_select = Select()
@@ -119,36 +123,37 @@ class AiPage(QWidget):
         header.addWidget(self.service_select)
 
         self.fullscreen_button = SoftButton("全屏", "ghost", height=28,
-                                            min_width=60, point_size=8.4)
+                                            min_width=64, point_size=9.4)
         self.fullscreen_button.setToolTip("全屏看 AI（Esc 退出）")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         if self._compact:
             header.addWidget(self.fullscreen_button)
-        root.addLayout(header)
+        root.addWidget(header)
 
         self.note = QLabel("")
         self.note.setObjectName("Tiny")
         root.addWidget(self.note)
 
-        # -------------------------------------------------- 三个页面
+        # -------------------------------------------------- 三个页面（顺序＝标签顺序）
         self.stack = QStackedWidget()
         from .ai_api_panel import ApiChatPanel
         from .ai_prompt_panel import PromptPanel
 
-        self.prompt_panel = PromptPanel(store, compact=compact, parent=self)
-        self.prompt_panel.saved.connect(
-            lambda title: self._set_note(f"提示词「{title}」已保存"))
-        self.stack.addWidget(self.prompt_panel)
+        self.api_panel = ApiChatPanel(store, compact=compact, parent=self)
+        self.api_panel.agent_requested.connect(self.open_agent)
+        self.api_panel.settings_requested.connect(self._open_llm_settings)
+        self.stack.addWidget(self.api_panel)
 
         url = self._resolve_url(self._service)
         self.web = EmbeddedWebPanel("lumina-ai", "ai", url, self,
                                     store=store, autofill=False)
         self.web.loaded.connect(self._on_loaded)
         self.stack.addWidget(self.web)
-        self.api_panel = ApiChatPanel(store, compact=compact, parent=self)
-        self.api_panel.agent_requested.connect(self.open_agent)
-        self.api_panel.settings_requested.connect(self._open_llm_settings)
-        self.stack.addWidget(self.api_panel)
+
+        self.prompt_panel = PromptPanel(store, compact=compact, parent=self)
+        self.prompt_panel.saved.connect(
+            lambda title: self._set_note(f"提示词「{title}」已保存"))
+        self.stack.addWidget(self.prompt_panel)
         root.addWidget(self.stack, 1)
 
         # 提前建好内嵌浏览器（原生窗口在窗口显示前创建），第一次切过去就不会整窗闪一下
@@ -166,14 +171,14 @@ class AiPage(QWidget):
                 pass
 
         self._rebuild_options()
-        self.set_tab(TAB_PROMPT, refresh=False)
+        self.set_tab(TAB_API, refresh=False)
 
     # -------------------------------------------------- 标签
     def current_tab(self) -> int:
         return self._tab
 
     def set_tab(self, index: int, refresh: bool = True) -> None:
-        index = index if index in (TAB_PROMPT, TAB_WEBUI, TAB_API) else TAB_PROMPT
+        index = index if index in (TAB_PROMPT, TAB_WEBUI, TAB_API) else TAB_API
         self._tab = index
         self.stack.setCurrentIndex(index)
         for button, own in ((self.prompt_tab, TAB_PROMPT),
@@ -203,13 +208,16 @@ class AiPage(QWidget):
     def _model_hint(self) -> str:
         from . import ai_chat
 
-        cfg = ai_chat.config(self.store)
         if not ai_chat.api_ready(self.store):
             return "还没配置接口：设置 → AI 接口 里选服务、填模型名和 API Key"
-        return f"接口：{cfg.get('model') or '（未填模型）'} · {cfg.get('base_url')}"
+        # 接口 / 模型 / 有没有 Key 已经在下面的状态行里写了，这里不再重复一遍
+        return ""
 
     def _set_note(self, text: str) -> None:
+        text = str(text or "")
         self.note.setText(text)
+        # 没话要说就把这一行收起来（不占地方，也不重复显示接口信息）
+        self.note.setVisible(bool(text.strip()))
 
     def open_api_chat(self) -> None:
         self.set_tab(TAB_API)

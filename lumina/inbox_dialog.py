@@ -13,7 +13,7 @@ class InboxDialog(QDialog):
     def __init__(self, store, parent=None):
         super().__init__(parent)
         self.store = store
-        self.setWindowTitle("Lumina · 收件箱")
+        self.setWindowTitle("DanLume · 收件箱")
         self.resize(920, 640)
 
         root = QVBoxLayout(self)

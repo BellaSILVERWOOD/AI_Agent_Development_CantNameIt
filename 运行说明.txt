@@ -1,0 +1,25 @@
+DanLume（旦光）1.0.0 源码版（不是双击就能用的那种）
+
+这个包只有**源代码**，没有 DanLume.exe —— 体积小是因为它不含 Python 运行库和
+Qt / Chromium（完整客户端包里那部分解压后有 480 多 MB）。
+界面截图在 docs\screenshots\ 里，README.md 就是按这些图写的。
+
+怎么跑起来（两种都行）：
+A. 双击 `启动 DanLume.bat`（或者英文名 `start.bat`）
+   第一次会自动装依赖，之后就直接启动；出错时窗口会停住显示报错。
+B. 命令行：
+       pip install -r requirements.txt
+       python main.py
+
+调试 / 排查问题（推荐给帮忙的人）：
+   启动 DanLume（调试）.bat / start-debug.bat   带日志启动，崩了会写 traceback
+   诊断.bat / diagnose.bat                     不开界面，打印环境+账户+日志，
+                                               并在 data\diagnostics\ 生成诊断包
+   详细说明见 `调试说明.txt`。
+
+说明：
+· client_only.flag 存在时是「客户端版」：不能自己新建账户，必须向管理员申请注册；
+· admin_pub.pem 是管理员公钥（注册申请、回执验证、模型接口授权都要用），别删；
+· 数据都在本目录的 data\ 里（数据库、附件、日志）；想换位置就设环境变量 LUMINA_DATA_DIR。
+· 「公式」页的实时预览需要本机装有 XeLaTeX（MiKTeX / TeX Live，xelatex 在 PATH 里）；
+· 一个人一套数据，同一个数据目录不要两台机器同时用。

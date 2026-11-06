@@ -44,25 +44,49 @@ class SmtpConfig:
     sender_email: str = ""
     account_id: str = ""
     account_label: str = ""
+    oauth: bool = False           # 用 OAuth2（XOAUTH2）登录，不需要密码
+    token_getter: Any = None      # 取 access_token 的函数（oauth=True 时用）
+
+    @classmethod
+    def from_account(cls, store, account: dict) -> "SmtpConfig":
+        """按**指定账户**建配置（验证码这类邮件要固定从学邮发）。"""
+        from . import accounts as accounts_module
+        from . import oauth2
+
+        account = dict(account or {})
+        gid = str(account.get("id") or "")
+        # 全局 smtp_oauth 只对微软的服务器生效（学邮/企业邮不能用 XOAUTH2）
+        host = str(account.get("host") or "").lower()
+        oauth_flag = (store.get_setting("smtp_oauth", "0") or "0") == "1"
+        microsoft = any(key in host for key in ("office365", "outlook", "hotmail"))
+        use_oauth = bool(account.get("oauth")) or (oauth_flag and microsoft)
+        return cls(
+            host=account.get("host", ""),
+            port=int(account.get("port", 465) or 465),
+            security=account.get("security", "ssl") or "ssl",
+            user=account.get("user", ""),
+            password=accounts_module.password(store, gid) if gid else "",
+            sender_name=account.get("sender_name", ""),
+            sender_email=account.get("sender_email", ""),
+            account_id=gid,
+            account_label=account.get("label", ""),
+            oauth=use_oauth,
+            token_getter=(lambda: oauth2.access_token(store)) if use_oauth else None,
+        )
 
     @classmethod
     def from_store(cls, store) -> "SmtpConfig":
-        """读取「当前选中的发件邮箱账户」。"""
+        """读取「当前选中的发件邮箱账户」。
+
+        注意：`smtp_oauth` 是**全局**开关，以前会对所有账户都开 XOAUTH2，
+        结果学邮（腾讯企业邮）也被当成微软服务器 → 登录失败。
+        现在只有微软的服务器才吃这个全局开关。
+        """
         from . import accounts as accounts_module
 
         account = accounts_module.active(store)
         if account is not None:
-            return cls(
-                host=account.get("host", ""),
-                port=int(account.get("port", 465) or 465),
-                security=account.get("security", "ssl") or "ssl",
-                user=account.get("user", ""),
-                password=accounts_module.password(store, account.get("id", "")),
-                sender_name=account.get("sender_name", ""),
-                sender_email=account.get("sender_email", ""),
-                account_id=account.get("id", ""),
-                account_label=account.get("label", ""),
-            )
+            return cls.from_account(store, account)
 
         # 兼容旧数据：没有账户列表时按单账户字段读取
         port_text = store.get_setting("smtp_port", "465")
@@ -183,18 +207,63 @@ def _connect(cfg: SmtpConfig) -> smtplib.SMTP:
     return client
 
 
+def _server_reply(exc: BaseException) -> str:
+    """把服务器原话摘出来（照着它才能知道到底哪一条不合规）。"""
+    parts = []
+    code = getattr(exc, "smtp_code", None)
+    error = getattr(exc, "smtp_error", None)
+    if code:
+        parts.append(str(code))
+    if error:
+        try:
+            parts.append(bytes(error).decode("utf-8", "replace"))
+        except Exception:
+            parts.append(str(error))
+    if not parts:
+        recipients = getattr(exc, "recipients", None)
+        if recipients:
+            parts.append(str(recipients))
+    text = " ".join(part.strip() for part in parts if str(part).strip())
+    return text[:160]
+
+
 def _friendly_error(exc: BaseException) -> str:
     if isinstance(exc, MailError):
         return str(exc)
     if isinstance(exc, smtplib.SMTPAuthenticationError):
-        return (
-            "登录被服务器拒绝（535）。请确认账号与「授权码 / 应用专用密码」是否正确，"
-            "QQ、163 等邮箱需要在邮箱设置中开启 SMTP 服务。"
+        code = getattr(exc, "smtp_code", 0) or 0
+        reply = _server_reply(exc)
+        hint = (
+            "登录被服务器拒绝"
+            + ("（535）" if int(code) == 535 else "")
+            + "。请确认账号与「授权码 / 应用密码」是否正确；"
+            "QQ / 163 等邮箱要在邮箱设置里开启 SMTP 服务。"
         )
+        if "basic authentication is disabled" in reply.lower() or "5.7.139" in reply:
+            hint = (
+                "服务器说「基础认证已停用」（535 5.7.139）。"
+                "这不是你填错密码：微软从 2024 年起关掉了 outlook.com / hotmail.com 的"
+                "「账号密码 + 应用密码」发信，只剩 OAuth2 能登。\n"
+                "换一个允许授权码的邮箱来发信最快：比如复旦学邮 "
+                "（smtp.exmail.qq.com，465，SSL）、QQ 邮箱、163 邮箱；"
+                "收信那边可以继续用 Outlook。"
+            )
+        elif "5.7.57" in reply or "not authenticated" in reply.lower():
+            hint = ("服务器说「未通过身份验证」（530 5.7.57）：这个发件账户还没保存密码 /"
+                    " 授权码，或者密码不对。到 设置 → 发件邮箱 填一次并保存。")
+        return hint + (f"（服务器原话：{reply}）" if reply else "")
     if isinstance(exc, smtplib.SMTPRecipientsRefused):
-        return "收件邮箱被服务器拒绝，请检查地址是否正确。"
+        return ("收件邮箱被服务器拒绝，请检查地址是否正确。"
+                + (f"（服务器原话：{_server_reply(exc)}）" if _server_reply(exc) else ""))
     if isinstance(exc, smtplib.SMTPSenderRefused):
-        return "发件邮箱被服务器拒绝，请检查「发件邮箱」是否与登录账号一致。"
+        code = getattr(exc, "smtp_code", 0) or 0
+        if int(code) in (530, 535):
+            return ("服务器要求先通过身份验证（530/535）：这个发件账户还没有保存密码 / 授权码，"
+                    "或者密码不对。请到 设置 → 发件邮箱（SMTP）填一次「授权码 / 应用密码」。"
+                    + (f"（服务器原话：{_server_reply(exc)}）" if _server_reply(exc) else ""))
+        return ("发件邮箱被服务器拒绝：服务器的「MAIL FROM」不接受这个地址。"
+                "请把「发件邮箱」改成与登录账号完全一致，或者换一个允许代发的邮箱。"
+                + (f"（服务器原话：{_server_reply(exc)}）" if _server_reply(exc) else ""))
     if isinstance(exc, smtplib.SMTPConnectError):
         return "服务器拒绝建立连接，请检查服务器地址、端口与加密方式。"
     if isinstance(exc, smtplib.SMTPServerDisconnected):
@@ -214,24 +283,88 @@ def _friendly_error(exc: BaseException) -> str:
     return f"发送失败：{exc}"
 
 
-def send_message(msg: EmailMessage, cfg: SmtpConfig) -> None:
+def _send_once(msg: EmailMessage, cfg: SmtpConfig) -> None:
     client = None
     try:
         client = _connect(cfg)
-        if cfg.user and cfg.password:
+        if cfg.oauth and cfg.user:
+            _login_xoauth2(client, cfg)
+        elif cfg.user and cfg.password:
             client.login(cfg.user, cfg.password)
         client.send_message(msg)
+    finally:
+        try:
+            if client is not None:
+                client.quit()
+        except Exception:
+            pass
+
+
+def _login_xoauth2(client, cfg: SmtpConfig) -> None:
+    """OAuth2 登录：AUTH XOAUTH2 <base64(user=…\\1auth=Bearer …\\1\\1)>。"""
+    from . import oauth2
+
+    if cfg.token_getter is None:
+        raise MailError("这个发件账户选了 OAuth2，但没有可用的授权（去设置里点「开始微软授权」）")
+    try:
+        token = str(cfg.token_getter() or "")
+    except oauth2.OAuthError as exc:
+        raise MailError(str(exc)) from exc
+    if not token:
+        raise MailError("OAuth2 授权为空，请重新授权一次")
+    try:
+        client.ehlo_or_helo_if_needed()
+    except Exception:
+        pass
+    code, response = client.docmd("AUTH", "XOAUTH2 " + oauth2.sasl_string(cfg.user, token))
+    if int(code) not in (235, 503):
+        detail = ""
+        try:
+            detail = response.decode("utf-8", "replace") if isinstance(response, bytes) else str(response)
+        except Exception:
+            detail = str(response)
+        raise smtplib.SMTPAuthenticationError(
+            int(code), detail.encode("utf-8", "replace")[:200])
+
+
+def _missing_password_error(cfg: SmtpConfig) -> str:
+    return (
+        "这个发件账户还没有保存「密码 / 授权码」，服务器不会放行发信。\n"
+        f"请到 设置 → 发件邮箱（SMTP）→「密码 / 授权码」里填一次并保存"
+        f"（账号 {cfg.user or '（未填）'}）。\n"
+        "QQ / 163 要填「授权码」；Outlook / 微软账户开了两步验证要填「应用密码」。"
+    )
+
+
+def send_message(msg: EmailMessage, cfg: SmtpConfig) -> None:
+    """发信。发件人被服务器拒绝时，自动换成「登录账号」重试一次。"""
+    import copy as _copy
+
+    # 没存密码还去连，服务器只会回 530「未认证」，提示很难懂；这里先拦住
+    # （选了 OAuth2 的账户不需要密码，跳过这个检查）
+    if (cfg.user and not cfg.password and not cfg.oauth
+            and not str(cfg.host).lower().startswith(
+                ("localhost", "127.", "10.", "192.168."))):
+        raise MailError(_missing_password_error(cfg))
+
+    try:
+        _send_once(msg, cfg)
+        return
+    except smtplib.SMTPSenderRefused as exc:
+        login_user = (cfg.user or "").strip()
+        current = (cfg.sender_email or "").strip()
+        if not login_user or login_user.lower() == current.lower():
+            raise MailError(_friendly_error(exc)) from exc
+        try:
+            retry = _copy.deepcopy(msg)
+            retry.replace_header("From", formataddr((cfg.sender_name or login_user,
+                                                     login_user)))
+            _send_once(retry, cfg)
+            return
+        except BaseException as second:  # noqa: BLE001
+            raise MailError(_friendly_error(second)) from second
     except BaseException as exc:  # 转成中文提示
         raise MailError(_friendly_error(exc)) from exc
-    finally:
-        if client is not None:
-            try:
-                client.quit()
-            except Exception:
-                try:
-                    client.close()
-                except Exception:
-                    pass
 
 
 def test_connection(cfg: SmtpConfig) -> Tuple[bool, str]:
@@ -239,6 +372,26 @@ def test_connection(cfg: SmtpConfig) -> Tuple[bool, str]:
         return False, "请先填写 SMTP 服务器地址"
     if not cfg.sender_email:
         return False, "请先填写发件邮箱"
+    if cfg.oauth:
+        client = None
+        try:
+            client = _connect(cfg)
+            _login_xoauth2(client, cfg)
+            return True, f"OAuth2 登录成功，服务器 {cfg.host}:{cfg.port} 可用"
+        except MailError as exc:
+            return False, str(exc)
+        except BaseException as exc:  # noqa: BLE001
+            return False, _friendly_error(exc)
+        finally:
+            try:
+                if client is not None:
+                    client.quit()
+            except Exception:
+                pass
+    if cfg.user and not cfg.password:
+        return False, ("还没有保存「密码 / 授权码」：现在只能连上服务器、不能登录发信。"
+                       "请填一次并保存（QQ/163 用授权码，Outlook 用应用密码）。"
+                       "Outlook 现在只能用 OAuth2，见下面「用 OAuth2 登录」。")
     client = None
     try:
         client = _connect(cfg)
@@ -302,9 +455,9 @@ def build_report(
                  style="max-width:660px;margin:0 auto;background:#ffffff;border-radius:10px;overflow:hidden;border:1px solid #e6e8f0;">
             <tr>
               <td style="padding:26px 30px 8px 30px;">
-                <div style="font-size:12px;letter-spacing:1px;color:{accent};font-weight:bold;">LUMINA · 工作汇报</div>
+                <div style="font-size:12px;letter-spacing:1px;color:{accent};font-weight:bold;">DANLUME · 工作汇报</div>
                 <div style="font-size:21px;font-weight:bold;color:{ink};margin-top:8px;">{html.escape(date_label)}</div>
-                <div style="font-size:12px;color:{muted};margin-top:4px;">由 Lumina 日程助手整理发送</div>
+                <div style="font-size:12px;color:{muted};margin-top:4px;">由 DanLume 日程助手整理发送</div>
                 <hr style="border:none;border-top:1px solid #eef0f6;margin:18px 0 0 0;" />
               </td>
             </tr>
@@ -391,8 +544,8 @@ def build_report(
               <td style="padding:10px 30px 26px 30px;">
                 <hr style="border:none;border-top:1px solid #eef0f6;margin:8px 0 14px 0;" />
                 <div style="font-size:12px;color:{muted};line-height:1.7;">
-                  此邮件由 Lumina 桌面助手生成。<br/>
-                  如需调整内容，可在 Lumina 的「发件箱」中重新编辑并发送。
+                  此邮件由 DanLume 桌面助手生成。<br/>
+                  如需调整内容，可在 DanLume 的「发件箱」中重新编辑并发送。
                 </div>
               </td>
             </tr>
@@ -421,6 +574,6 @@ def build_report(
         text_lines.append("")
     if note.strip():
         text_lines += ["补充说明：", note.strip(), ""]
-    text_lines += ["—— 由 Lumina 桌面助手生成", ""]
+    text_lines += ["—— 由 DanLume 桌面助手生成", ""]
     text_body = "\n".join(text_lines)
     return subject, html_body, text_body

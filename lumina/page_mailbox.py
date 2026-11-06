@@ -85,6 +85,7 @@ class MailboxPage(QWidget):
         self.stack = QStackedWidget()
         self.inbox = InboxPanel(store, self)
         self.inbox.loaded.connect(self._on_inbox_loaded)
+        self.inbox.bounced.connect(self._on_inbox_bounced)
         self.inbox.request_settings.connect(self.request_settings)
         self.stack.addWidget(self.inbox)
 
@@ -167,6 +168,17 @@ class MailboxPage(QWidget):
 
     def _on_outbox_changed(self) -> None:
         self.data_changed.emit()
+
+    def _on_inbox_bounced(self, marked) -> None:
+        """收到退信：刷新发件箱（状态变成「已退信」）并提醒一次。"""
+        try:
+            self.outbox.refresh()
+        except Exception:
+            pass
+        self._update_tab_counts()
+        self.data_changed.emit()
+        if self._tab == TAB_INBOX and self.inbox.summary:
+            self.subtitle.setText(self.inbox.summary)
 
     def _update_tab_counts(self) -> None:
         drafts = 0

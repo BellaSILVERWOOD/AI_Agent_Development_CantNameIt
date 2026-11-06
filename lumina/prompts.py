@@ -32,13 +32,21 @@ from .config import DATA_DIR
 
 FILE_NAME = "prompts.json"
 VERSION = 1
+# 助手人格：品牌叫 DanLume，AI 自己叫 Lume（中文名「卢梅」）
+PERSONA = "你是 Lume（卢梅），DanLume 里的写作与学习助手。"
+# 老版本的默认人格：迁移时替换掉；用户自己改过的人设不动
+# （这里必须保留旧的写法，否则老库里的 prompts.json 认不出来）
+LEGACY_PERSONAS = (
+    "你是 Lumina 里的写作与学习助手。",
+    "你是 DanLume 里的写作与学习助手。",
+)
 
 DEFAULTS: Dict[str, Any] = {
     "version": VERSION,
-    "note": "这里是 Lumina 的提示词配置，可以自己改；改完重启软件生效。",
+    "note": "这里是 DanLume 的提示词配置，可以自己改；改完重启软件生效。",
     "system": {
         "assistant": (
-            "你是 Lumina 里的写作与学习助手。回答用简体中文，简洁直接，"
+            PERSONA + "回答用简体中文，简洁直接，"
             "先给结论再给要点；不确定的地方要说明不确定，不要编造。"
         ),
         "weekly_report": (
@@ -106,17 +114,85 @@ def load() -> Dict[str, Any]:
 
 
 def ensure() -> Path:
-    """确保配置文件存在（首次运行时写一份默认的出来，方便用户直接改）。"""
+    """确保配置文件存在（首次运行时写一份默认的出来），并把旧品牌/旧人格迁移掉。"""
     target = path()
-    if target.exists():
+    if not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(DEFAULTS, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
         return target
+    migrate_brand(target)
+    return target
+
+
+def migrate_brand(target: Optional[Path] = None) -> bool:
+    """把老的「Lumina」品牌与老默认人格换成 DanLume / Lume（卢梅）。
+
+    只改**字符串里出现的品牌词和那几句老默认人格**，用户自己写的其它内容原样保留。
+    返回是否改过（改过就写回文件）。
+    """
+    target = Path(target) if target is not None else path()
+    if not target.exists():
+        return False
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            json.dumps(DEFAULTS, ensure_ascii=False, indent=2), encoding="utf-8")
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    changed = [False]
+
+    def fix(value: str, persona: bool) -> str:
+        """persona=True 说明这是提示词正文（旧品牌名要换成人格名 Lume），
+        否则是说明文字（旧品牌名换成产品名 DanLume）。"""
+        text = str(value)
+        for legacy in LEGACY_PERSONAS:
+            if text.startswith(legacy):
+                text = PERSONA + text[len(legacy):].lstrip()
+                changed[0] = True
+        # 以前用户自己写的「你是复旦大学学生学习助手 Lumina 光华。……」
+        # 按要求统一成「你是 Lume（卢梅），复旦大学学生的学习助手。」
+        if persona and text.startswith("你是复旦大学学生学习助手"):
+            head, sep, tail = text.partition("。")
+            if sep:
+                text = "你是 Lume（卢梅），复旦大学学生的学习助手" + sep + tail
+                changed[0] = True
+        if "Lumina" in text:
+            text = text.replace("Lumina 光华", "Lume 卢梅")
+            text = text.replace("Lumina光华", "Lume卢梅")
+            text = text.replace("Lumina", "Lume" if persona else "DanLume")
+            changed[0] = True
+        return text
+
+    def walk(node, persona: bool = True):
+        if isinstance(node, dict):
+            return {key: walk(value, persona and key != "note")
+                    for key, value in node.items()}
+        if isinstance(node, list):
+            return [walk(value, persona) for value in node]
+        if isinstance(node, str):
+            return fix(node, persona)
+        return node
+
+    updated = walk(data)
+    if not changed[0]:
+        return False
+    updated["version"] = VERSION
+    try:
+        from datetime import datetime
+
+        updated["updated_at"] = datetime.now().isoformat(timespec="seconds")
     except Exception:
         pass
-    return target
+    try:
+        target.write_text(json.dumps(updated, ensure_ascii=False, indent=2),
+                          encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 
 def save(values: Dict[str, Any]) -> bool:

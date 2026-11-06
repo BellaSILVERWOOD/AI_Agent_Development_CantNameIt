@@ -70,7 +70,7 @@ class AgentDialog(QDialog):
         self._items: List[Dict[str, Any]] = []
         self._boxes: List[QCheckBox] = []
 
-        self.setWindowTitle("Lumina · Agent")
+        self.setWindowTitle("DanLume · Agent")
         self.resize(700, 640)
         colors = tokens()
         self._colors = colors
@@ -121,6 +121,30 @@ class AgentDialog(QDialog):
             self.uia_box.setEnabled(False)
             self.uia_box.setText("直接读取微信不可用（需要 PowerShell + 系统中文 OCR）")
         root.addWidget(self.uia_box)
+
+        # -------------------------------------------------- 盯邮箱
+        watch_row = QHBoxLayout()
+        watch_row.setSpacing(6)
+        from . import mail_watch
+
+        self.watch_box = QCheckBox("盯邮箱")
+        self.watch_box.setStyleSheet(f"QCheckBox {{ color: {colors['soft']}; }}")
+        self.watch_box.setChecked(mail_watch.enabled(self.store))
+        self.watch_box.setToolTip(
+            "只看这些发件人的新邮件：识别里面的待办，弹窗让你确认后再加日程")
+        self.watch_box.toggled.connect(self._on_watch_toggled)
+        watch_row.addWidget(self.watch_box)
+        self.watch_senders = QLineEdit(
+            self.store.get_setting(mail_watch.SENDERS_KEY, ""))
+        self.watch_senders.setPlaceholderText("发件人关键词，逗号分隔（如 教务处,李老师）")
+        self.watch_senders.setFixedHeight(28)
+        self.watch_senders.editingFinished.connect(self._on_watch_senders_changed)
+        watch_row.addWidget(self.watch_senders, 1)
+        self.watch_hint = QLabel("")
+        self.watch_hint.setObjectName("Tiny")
+        watch_row.addWidget(self.watch_hint)
+        root.addLayout(watch_row)
+        self._refresh_watch_hint()
 
         # -------------------------------------------------- 聊天记录
         self.view = QTextBrowser()
@@ -214,6 +238,61 @@ class AgentDialog(QDialog):
             bar.setValue(bar.maximum())
         except Exception:
             pass
+
+    # -------------------------------------------------- 盯邮箱
+    def _refresh_watch_hint(self) -> None:
+        try:
+            from . import imap_inbox, mail_watch
+
+            if not imap_inbox.list_accounts(self.store):
+                self.watch_hint.setText("（还没配置 IMAP 账户）")
+                return
+            if not mail_watch.enabled(self.store):
+                self.watch_hint.setText("（关）")
+                return
+            minutes = mail_watch.interval_minutes(self.store)
+            if not mail_watch.senders(self.store):
+                self.watch_hint.setText("（填个发件人）")
+            else:
+                self.watch_hint.setText(f"每 {minutes} 分钟看一次")
+        except Exception:
+            self.watch_hint.setText("")
+
+    def _on_watch_toggled(self, on: bool) -> None:
+        from . import mail_watch
+
+        mail_watch.set_enabled(self.store, on)
+        self._refresh_watch_hint()
+        self._restart_watcher()
+
+    def _on_watch_senders_changed(self) -> None:
+        from . import mail_watch
+
+        mail_watch.set_senders(self.store, self.watch_senders.text())
+        self._refresh_watch_hint()
+        self._restart_watcher()
+
+    def _restart_watcher(self) -> None:
+        window = self.window()
+        watcher = getattr(window, "mail_watch", None)
+        if watcher is not None:
+            try:
+                watcher.restart()
+            except Exception:
+                pass
+
+    # -------------------------------------------------- 外部喂数据（盯邮箱用）
+    def present_items(self, items: List[Dict[str, Any]], note: str = "") -> None:
+        """把别处识别出来的候选日程直接摆到确认列表里。"""
+        items = [dict(item) for item in (items or [])]
+        if not items:
+            self._append("system", "这次没识别到需要加日程的事")
+            return
+        if note:
+            self._append("system", note)
+        self._append("assistant",
+                     f"识别到 {len(items)} 条可能需要加进日程的事，你确认一下：")
+        self._show_candidates(items)
 
     # -------------------------------------------------- 发微信
     def open_send_dialog(self) -> None:

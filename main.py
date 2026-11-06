@@ -1,15 +1,16 @@
-"""Lumina 桌面应用入口。"""
+"""DanLume（旦光）桌面应用入口。"""
 from __future__ import annotations
 
 import ctypes
 import os
 import sys
+import traceback
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import QApplication
 
 from lumina import theme
-from lumina.config import APP_TITLE, DATA_DIR, DB_PATH
+from lumina.config import APP_NAME, APP_TITLE, DATA_DIR, DB_PATH
 from lumina.main_window import MainWindow, hard_exit
 from lumina.store import Store
 
@@ -67,7 +68,7 @@ def _set_app_user_model_id() -> None:
         return
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "Lumina.Schedule.Hub.1"
+            "DanLume.Schedule.Hub.1"
         )
     except Exception:
         pass
@@ -86,23 +87,62 @@ def _configure_text_rendering() -> None:
 
 
 def main() -> int:
-    smoke = "--smoke-test" in sys.argv
+    argv = sys.argv[1:]
+    # 「诊断入口」：不打开界面，直接把环境 / 数据目录 / 账户 / 设置 / 日志打印出来，
+    # 带 --export 再打一个 zip 发给帮忙排查的人。见 lumina/diag.py。
+    if "--diagnose" in argv or "--diag" in argv:
+        from lumina import diag
+
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace") \
+            if hasattr(sys.stdout, "reconfigure") else None
+        return diag.cli(argv)
+    debug = "--debug" in argv or "--debug-log" in argv
+    if debug:
+        # 先开日志和崩溃捕获：后面任何一步崩了都能留下 traceback
+        try:
+            from lumina import diag
+
+            diag.enable_debug_logging()
+        except Exception:
+            traceback.print_exc()
+    smoke = "--smoke-test" in argv
     if smoke:
         # 冒烟测试不去碰 Chromium 配置目录，免得和正在用的实例抢锁
         os.environ.setdefault("LUMINA_SMOKE", "1")
     _set_app_user_model_id()
     _configure_text_rendering()
     app = QApplication(sys.argv)
-    app.setApplicationName("Lumina")
+    app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_TITLE)
-    app.setOrganizationName("Lumina")
+    app.setOrganizationName(APP_NAME)
     app.setQuitOnLastWindowClosed(True)
+    # 滚轮不许改控件的值：设置里滚页面时，别把下拉/滑杆/勾选框滚出别的值来
+    try:
+        from lumina import wheel_guard
+
+        wheel_guard.install(app)
+    except Exception:
+        pass
 
     store = Store(DB_PATH)
+    # 多套 API 配置：老的「单套」设置第一次运行会变成第 1 套，之后在面板/设置里随时切换
+    try:
+        from lumina import llm_profiles
+
+        llm_profiles.migrate(store)
+    except Exception:
+        pass
     theme.migrate_to_apple(store)
     theme.load_bundled_fonts()
     theme.load_from_store(store)
     theme.apply_theme(app)
+    # 提示气泡自己画（Qt 默认那个会继承控件颜色，深色下变「黑底深字」）
+    try:
+        from lumina import tooltip
+
+        tooltip.install(app)
+    except Exception:
+        pass
     try:
         from lumina import settings_dirs
 
@@ -133,13 +173,57 @@ def main() -> int:
 
             QMessageBox.information(
                 None, APP_TITLE,
-                "Lumina 已经在运行了。\n\n同时开两个会抢浏览器配置，网页可能打不开，"
+                "DanLume 已经在运行了。\n\n同时开两个会抢浏览器配置，网页可能打不开，"
                 "所以这里就不再启动第二个窗口了。")
             store.close()
             return 0
 
+    # 登录：账户存在本机（密码只存 PBKDF2 哈希），本地比对；「记住这台设备」24/48 小时
+    current_user = None
+    if not smoke and "--no-login" not in sys.argv:
+        from lumina import users
+
+        try:
+            current_user = users.auto_login(store)
+        except Exception:
+            current_user = None
+        if current_user is None and users.login_required(store):
+            from PySide6.QtWidgets import QDialog
+
+            from lumina.login_window import LoginWindow
+
+            login = LoginWindow(store)
+            if login.exec() != QDialog.DialogCode.Accepted or login.user is None:
+                store.close()
+                return 0
+            current_user = login.user
+
+    # 让各处都能知道「现在登录的是谁」（管理员不受接口授权 / 使用限制）。
+    # 必须在建主窗口之前登记：设置页一构造就会用它决定要不要显示「申请授权」。
+    try:
+        from lumina import users as users_module
+
+        users_module.set_current_user_provider(lambda: current_user)
+    except Exception:
+        pass
+
     window = MainWindow(store)
+    # 有系统托盘时：窗口收进托盘不算「关掉了」，程序要继续在后台跑
+    try:
+        if window.tray_available():
+            app.setQuitOnLastWindowClosed(False)
+    except Exception:
+        pass
+    window.current_user = current_user
     window._instance_lock = instance_lock
+    # 管理员第一次登录时把密钥准备好（公钥会写到程序根目录，随安装包分发）
+    try:
+        from lumina import adminsign, users as users_module
+
+        if users_module.is_admin(current_user) and not adminsign.has_private_key(store):
+            adminsign.generate_keypair(store)
+    except Exception:
+        pass
     if smoke:
         window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
     window.show()

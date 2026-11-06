@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QFont, QImage, QTextBlockFormat, QTextCharFormat, QTextCursor,
     QTextImageFormat, QTextListFormat,
@@ -26,7 +26,9 @@ from . import (
     latex_mathdialog, theme,
 )
 from .popup import RoundedPopup
-from .widgets import Card, IconButton, Pill, Select, SoftButton, ToggleSwitch
+from .widgets import (
+    Card, HScrollRow, IconButton, Pill, Select, SoftButton, ToggleSwitch,
+)
 
 MONO_STACK = ["Cascadia Code", "Consolas", "JetBrains Mono", "Segoe UI"]
 BODY_SIZES = [10.5, 11, 12, 13, 14, 15, 16, 18, 20, 24]
@@ -98,6 +100,10 @@ class DocEditor(QTextEdit):
             block_format.setHeadingLevel(0)
             block_format.setLeftMargin(0)
             block_format.setIndent(0)
+            block_format.setTopMargin(6)
+            block_format.setBottomMargin(10)
+            block_format.setLineHeight(
+                150.0, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
             cursor = self.textCursor()
             cursor.setBlockFormat(block_format)
             char_format = QTextCharFormat()
@@ -136,6 +142,9 @@ class GreekPicker(RoundedPopup):
 
 
 class LatexPage(QWidget):
+    #: 公式渲染分辨率：插进文档时再按字号缩小，这样放大看也不糊
+    #: 公式渲染分辨率：越高越清晰（屏幕缩放 125% 也不会糊）
+    MATH_DPI = 600
     """文档 → LaTeX 编辑页面。"""
 
     data_changed = Signal()
@@ -176,8 +185,8 @@ class LatexPage(QWidget):
         root.setSpacing(10)
 
         # ---------------- 标题行
-        header = QHBoxLayout()
-        header.setSpacing(8)
+        # 分栏变窄时这一排放不下 → 横向滚动，而不是叠在一起
+        header = HScrollRow(height=48, spacing=8)
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
         title = QLabel("文档编辑器")
@@ -223,7 +232,7 @@ class LatexPage(QWidget):
                                          glyph=icons.EYE, point_size=8.6)
         self.compile_button.clicked.connect(self.compile_now)
         header.addWidget(self.compile_button)
-        root.addLayout(header)
+        root.addWidget(header)
 
         self.toolbar = self._build_toolbar()
         root.addWidget(self.toolbar)
@@ -253,9 +262,11 @@ class LatexPage(QWidget):
         self.doc_editor.setFont(self._body_font())
         self.doc_editor.setStyleSheet(
             f"QTextEdit {{ background: {theme.CARD}; color: {theme.TEXT};"
-            f" border: 1px solid {theme.BORDER}; border-radius: 10px; padding: 16px; }}"
+            f" border: 1px solid {theme.BORDER}; border-radius: 10px;"
+            f" padding: 18px 22px; }}"
         )
-        self.doc_editor.document().setDocumentMargin(12)
+        # 像一页纸：四周留出页边距（Word 那种感觉），正文行距/段距在 _style_document 里
+        self.doc_editor.document().setDocumentMargin(46)
         self.doc_editor.textChanged.connect(self._on_document_changed)
         self.doc_editor.math_activated.connect(self._edit_math_at)
         self.doc_editor.math_requested.connect(self.open_inline_math)
@@ -291,7 +302,20 @@ class LatexPage(QWidget):
         preview_head.addWidget(self.next_button)
         preview_card.body.addLayout(preview_head)
         self.pdf_view = self._make_pdf_view()
-        preview_card.body.addWidget(self.pdf_view, 1)
+        # 预览区：没内容时别留一块灰 —— 给一句说明 / 编译中的提示
+        self.preview_stack = QStackedWidget()
+        self.preview_stack.addWidget(self.pdf_view)
+        self.preview_hint = QLabel("点右上角「编译预览」生成 PDF")
+        self.preview_hint.setObjectName("Muted")
+        self.preview_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_hint.setWordWrap(True)
+        self.preview_hint.setContentsMargins(18, 18, 18, 18)
+        self.preview_hint.setStyleSheet(
+            f"QLabel {{ background: {theme.CARD_ALT}; color: {theme.MUTED};"
+            f" border: 1px dashed {theme.BORDER}; border-radius: 10px; }}")
+        self.preview_stack.addWidget(self.preview_hint)
+        self.preview_stack.setCurrentWidget(self.preview_hint)
+        preview_card.body.addWidget(self.preview_stack, 1)
         splitter.addWidget(preview_card)
         splitter.setSizes([620, 560])
         root.addWidget(splitter, 1)
@@ -366,8 +390,8 @@ class LatexPage(QWidget):
 
     def _build_toolbar(self) -> QWidget:
         card = Card(radius=14, fill=theme.CARD, border=theme.BORDER, padding=10, spacing=8)
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
+        # 分栏变窄时这两排放不下 → 各自横向滚动，而不是叠在一起
+        row1 = HScrollRow(height=36, spacing=6)
         self.style_select = Select()
         self.style_select.setFixedWidth(110)
         for name in STYLE_ITEMS:
@@ -398,10 +422,9 @@ class LatexPage(QWidget):
         row1.addWidget(self._tool("• 列表", "无序列表", lambda: self._toggle_list(False), 62))
         row1.addWidget(self._tool("1. 列表", "有序列表", lambda: self._toggle_list(True), 66))
         row1.addStretch(1)
-        card.body.addLayout(row1)
+        card.body.addWidget(row1)
 
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
+        row2 = HScrollRow(height=36, spacing=6)
         row2.addWidget(self._tool("行内公式", "插入行内公式（$…$）",
                                   lambda: self.open_math(False), 78))
         row2.addWidget(self._tool("行间公式", "插入行间公式（\\[…\\]）",
@@ -416,7 +439,7 @@ class LatexPage(QWidget):
                                            self.toggle_math_display, 96)
         row2.addWidget(self.math_mode_button)
         row2.addStretch(1)
-        card.body.addLayout(row2)
+        card.body.addWidget(row2)
         return card
 
     # -------------------------------------------------- 视图切换
@@ -565,62 +588,147 @@ class LatexPage(QWidget):
         self._merge(fmt)
 
     # -------------------------------------------------- 插入
-    def _register_math_resource(self, latex: str, display: bool) -> Optional[str]:
+    def _screen_image(self, image: QImage, width: float,
+                      height: float) -> QImage:
+        """把公式图缩成「逻辑尺寸 × 屏幕缩放比」的设备像素（不糊的关键）。
+
+        QTextDocument 画图片时用的缩放很粗糙（还可能用最近邻），所以**我们自己**
+        先按目标尺寸做一次平滑缩放；再把格式的宽高写成逻辑尺寸，Qt 就 1:1 画到
+        设备像素上。以前是直接塞 360 DPI 的原图让 Qt 去缩，高分屏上看着发虚。
+        """
+        try:
+            dpr = float(self.doc_editor.devicePixelRatioF() or 1.0)
+        except Exception:
+            dpr = 1.0
+        target_w = max(1, int(round(float(width) * dpr)))
+        target_h = max(1, int(round(float(height) * dpr)))
+        scaled = image.scaled(
+            target_w, target_h,
+            aspectMode=Qt.AspectRatioMode.IgnoreAspectRatio,
+            mode=Qt.TransformationMode.SmoothTransformation)
+        # 透明 PNG 叠在编辑区里会发灰，先合到不透明底色上
+        opaque = QImage(scaled.size(), QImage.Format.Format_RGB32)
+        opaque.fill(QColor(theme.CARD))
+        from PySide6.QtGui import QPainter
+
+        painter = QPainter(opaque)
+        painter.drawImage(0, 0, scaled)
+        painter.end()
+        return opaque
+
+    def _register_math_resource(self, latex: str, display: bool,
+                                width: float = 0.0,
+                                height: float = 0.0) -> Optional[str]:
         """把渲染好的公式注册为文档图片资源，返回资源名。"""
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QTextDocument
 
-        path = latex_math.render(latex, display)
+        path = latex_math.render(latex, display, dpi=self.MATH_DPI,
+                                 color=str(theme.TEXT))
         if not path:
             return None
         image = QImage(path)
         if image.isNull():
             return None
+        if width <= 0 or height <= 0:
+            width, height = self._math_display_size(image, display)
+        prepared = self._screen_image(image, width, height)
         name = latex_export.math_payload(latex, display)
-        # 透明 PNG 叠在编辑区里会发灰，先合到不透明底色上再注册
-        opaque = QImage(image.size(), QImage.Format.Format_RGB32)
-        opaque.fill(QColor(theme.CARD))
-        from PySide6.QtGui import QPainter
-
-        painter = QPainter(opaque)
-        painter.drawImage(0, 0, image)
-        painter.end()
         self.doc_editor.document().addResource(
-            QTextDocument.ResourceType.ImageResource, QUrl(name), opaque)
+            QTextDocument.ResourceType.ImageResource, QUrl(name), prepared)
         return name
+
+    def _math_display_size(self, image: QImage, display: bool) -> tuple:
+        """公式在文档里显示多大：按**正文字号**换算，而不是把渲染像素直接铺上去。
+
+        渲染是 360 DPI、排版基准 12pt；屏幕 96 DPI，所以「12pt 公式」的原尺寸
+        就是 像素 × 96/DPI。再按当前字号（默认 11pt）缩放，行内略小、行间略大。
+        以前直接乘 0.72，结果一张 1000px 宽的公式被画成 720px，又糊又大。
+        """
+        try:
+            point_size = float(self._cursor().charFormat().fontPointSize() or 0)
+        except Exception:
+            point_size = 0.0
+        if point_size <= 0:
+            point_size = float(self.doc_editor.font().pointSizeF() or 11.0)
+        body_px = point_size * 96.0 / 72.0
+        natural_w = image.width() * 96.0 / float(self.MATH_DPI)
+        natural_h = image.height() * 96.0 / float(self.MATH_DPI)
+        factor = body_px / (12.0 * 96.0 / 72.0)
+        # 行间公式只比正文大一点点（以前 ×1.25 显得特别大，跟正文不在一个节奏上）
+        factor *= 1.08 if display else 1.0
+        return natural_w * factor, natural_h * factor
+
+    def _style_document(self) -> None:
+        """把整篇排成「一页纸」：正文行距 1.5、段间距、页边距（Word 的感觉）。"""
+        document = self.doc_editor.document()
+        cursor = QTextCursor(document)
+        cursor.beginEditBlock()
+        block = document.begin()
+        changed = False
+        while block.isValid():
+            fmt = block.blockFormat()
+            # 只补默认值，别覆盖用户自己设的对齐 / 缩进 / 标题
+            if fmt.headingLevel() == 0:
+                if fmt.topMargin() < 1:
+                    fmt.setTopMargin(6)
+                if fmt.bottomMargin() < 1:
+                    fmt.setBottomMargin(10)
+            if fmt.lineHeight() <= 0:
+                fmt.setLineHeight(
+                    150.0, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value)
+            probe = QTextCursor(block)
+            probe.setBlockFormat(fmt)
+            changed = True
+            block = block.next()
+        cursor.endEditBlock()
+        if changed:
+            self.doc_editor.update()
 
     def _insert_math_object(self, latex: str, display: bool) -> bool:
         if self._math_display == "source":
             return self._insert_math_text(latex, display)
-        path = latex_math.render(latex, display)
+        path = latex_math.render(latex, display, dpi=self.MATH_DPI,
+                                 color=str(theme.TEXT))
         if not path:
             self._set_status("公式渲染失败，请检查 LaTeX 语法", "error")
             return False
         image = QImage(path)
         if image.isNull():
             return False
-        width = image.width() * 0.72
-        height = image.height() * 0.72
-        if display:
-            width, height = width * 1.25, height * 1.25
-        limit = 520.0
+        width, height = self._math_display_size(image, display)
+        limit = max(200.0, float(self.doc_editor.viewport().width()) - 60.0)
         if width > limit:
             rate = limit / width
             width, height = limit, height * rate
-        name = self._register_math_resource(latex, display)
+        name = self._register_math_resource(latex, display, width, height)
         if not name:
             return False
         fmt = QTextImageFormat()
         fmt.setName(name)
         fmt.setWidth(width)
         fmt.setHeight(height)
+        try:
+            # 行内公式跟文字**居中在同一行**（以前贴着行底，看着「浮」在文字上面）
+            fmt.setVerticalAlignment(
+                QTextCharFormat.VerticalAlignment.AlignMiddle)
+        except Exception:
+            pass
         cursor = self._cursor()
         if display:
             cursor.insertBlock()
+            block_format = cursor.blockFormat()
+            # 行间公式跟 PDF 里一样居中
+            block_format.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            cursor.setBlockFormat(block_format)
             cursor.insertImage(fmt)
             cursor.insertBlock()
+            plain = QTextBlockFormat()
+            plain.setAlignment(Qt.AlignmentFlag.AlignLeft)
+            cursor.setBlockFormat(plain)
         else:
             cursor.insertImage(fmt)
+        self._style_document()
         self.doc_editor.setFocus()
         return True
 
@@ -821,35 +929,52 @@ class LatexPage(QWidget):
             return
         self.compile_now()
 
+    def _show_preview_hint(self, text: str) -> None:
+        """预览区没有 PDF 时显示一句说明（而不是一块灰）。"""
+        try:
+            self.preview_hint.setText(text)
+            self.preview_stack.setCurrentWidget(self.preview_hint)
+        except Exception:
+            pass
+
     def compile_now(self) -> None:
         if self._compiling:
             return
         if not latex_compile.engine_available():
             self._set_status("没有找到 xelatex，请先安装 MiKTeX 或 TeX Live", "error")
+            self._show_preview_hint(
+                "没找到 xelatex。\n装好 MiKTeX 或 TeX Live 后重启应用即可预览。")
             return
         self._compiling = True
         self._set_status("正在编译…")
+        self._show_preview_hint("正在编译…\n第一次编译要装字体和宏包，可能要十几秒。")
         self._compiler.compile(self._current_source())
 
     def _on_compiled(self, ok: bool, pdf_path: str, message: str) -> None:
         self._compiling = False
         if not ok:
             self._set_status(message or "编译失败", "error")
+            self._show_preview_hint(
+                "编译失败：\n" + (message or "看看源码里有没有写错的命令"))
             return
         if self.pdf_doc is None:
             self._set_status("编译成功，但当前环境无法显示 PDF", "warn")
+            self._show_preview_hint("编译成功了，但当前环境缺少 QtPdf，没法在这里显示。")
             return
         try:
             self.pdf_doc.close()
             error = self.pdf_doc.load(pdf_path)
             if error != self.pdf_doc.Error.None_:
                 self._set_status(f"PDF 打开失败：{error}", "error")
+                self._show_preview_hint(f"PDF 打不开：{error}")
                 return
             self.pdf_view.setDocument(self.pdf_doc)
+            self.preview_stack.setCurrentWidget(self.pdf_view)
             self._sync_page_label(0)
             self._set_status(f"编译成功 · {Path(pdf_path).name}", "ok")
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"预览出错：{exc}", "error")
+            self._show_preview_hint(f"预览出错：{exc}")
 
     def _sync_page_label(self, page: int = 0) -> None:
         if self.pdf_doc is None:
@@ -868,7 +993,10 @@ class LatexPage(QWidget):
             navigator = self.pdf_view.pageNavigator()
             target = max(0, min(self.pdf_doc.pageCount() - 1,
                                 navigator.currentPage() + delta))
-            navigator.jumpTo(target, navigator.currentLocation())
+            # Qt 6.10 里叫 jump()，老版本叫 jumpTo()，两个都试一下
+            jump = getattr(navigator, "jump", None) or getattr(navigator, "jumpTo", None)
+            if jump is not None:
+                jump(target, QPointF(0.0, 0.0))
         except Exception:
             pass
 
@@ -926,6 +1054,7 @@ class LatexPage(QWidget):
             self.set_mode("source")
         else:
             self.doc_editor.setHtml(text)
+            self._style_document()
         self._set_status(f"已打开 {target.name}", "ok")
         if self._auto_compile:
             self._auto_timer.start(400)
@@ -957,8 +1086,10 @@ class LatexPage(QWidget):
             self.doc_editor.setHtml(html)
             self.doc_editor.blockSignals(False)
             self._reregister_math_resources()
+            self._style_document()
         else:
             self._load_sample()
+            self._style_document()
         self.source_editor.blockSignals(True)
         self.source_editor.setPlainText(
             self.store.get_setting("latex_source", "") or "")
@@ -977,9 +1108,12 @@ class LatexPage(QWidget):
                 if fragment.isValid():
                     fmt = fragment.charFormat()
                     if fmt.isImageFormat():
-                        payload = latex_export.decode_math(fmt.toImageFormat().name())
+                        image_fmt = fmt.toImageFormat()
+                        payload = latex_export.decode_math(image_fmt.name())
                         if payload is not None:
-                            self._register_math_resource(payload[0], payload[1])
+                            self._register_math_resource(
+                                payload[0], payload[1],
+                                image_fmt.width(), image_fmt.height())
                 iterator += 1
             block = block.next()
 

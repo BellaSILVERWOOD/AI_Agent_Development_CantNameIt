@@ -85,7 +85,7 @@ class ExamImportDialog(QDialog):
         self._rows: List[ExamRowWidget] = []
         colors = _colors()
         self.setStyleSheet(f"QDialog {{ background: {colors['CARD']}; }}")
-        self.setWindowTitle("Lumina · 导入考试安排")
+        self.setWindowTitle("DanLume · 导入考试安排")
         self.resize(1120, 820)
 
         root = QVBoxLayout(self)

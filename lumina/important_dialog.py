@@ -80,7 +80,7 @@ class ImportantDialog(QDialog):
     def __init__(self, store, parent=None):
         super().__init__(parent)
         self.store = store
-        self.setWindowTitle("Lumina · 重要日")
+        self.setWindowTitle("DanLume · 重要日")
         self.resize(560, 520)
 
         colors = ImportantRow._colors()

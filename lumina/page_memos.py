@@ -14,11 +14,11 @@ from PySide6.QtWidgets import (
 )
 
 from . import icons, theme
-from .widgets import Card, IconButton, Select, SoftButton, make_scroll
+from .widgets import Card, HScrollRow, IconButton, Select, SoftButton, make_scroll
 
-# 正文 / 标题的默认字号（按用户给的规格：标题 13 加粗，正文 10 不加粗）
+# 正文 / 标题的默认字号（用户规格：标题 16 加粗，正文 10 不加粗）
 BODY_SIZE = 10.0
-TITLE_SIZE = 13.0
+TITLE_SIZE = 16.0
 
 STYLE_ITEMS = ["正文", "标题", "副标题", "一级小标题", "二级小标题", "自定义"]
 STYLE_SIZES = {
@@ -127,6 +127,12 @@ class MemosPage(QWidget):
         self._save_timer.setInterval(700)
         self._save_timer.timeout.connect(self._save_current)
 
+        # 粘贴多行文本时，整篇会继承标题格式；停手后再纠正回来
+        self._format_timer = QTimer(self)
+        self._format_timer.setSingleShot(True)
+        self._format_timer.setInterval(280)
+        self._format_timer.timeout.connect(self._fix_uniform_title_format)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 14, 20, 16)
         root.setSpacing(10)
@@ -202,6 +208,12 @@ class MemosPage(QWidget):
         self.editor.textChanged.connect(self._on_text_changed)
         self.editor.mousePressEvent = self._editor_mouse_press  # 点方框切换待办
         self.editor.keyPressEvent = self._editor_key_press      # 标题行回车接正文
+        try:
+            self.editor.cursorPositionChanged.connect(self._sync_toolbar_state)
+            self.editor.currentCharFormatChanged.connect(
+                lambda _fmt: self._sync_toolbar_state())
+        except Exception:
+            pass
         editor_card.body.addWidget(self.editor, 1)
 
         self.status = QLabel("")
@@ -219,13 +231,16 @@ class MemosPage(QWidget):
         button = SoftButton(text, "ghost", height=30, min_width=width, point_size=8.8)
         button.setToolTip(tip)
         button.clicked.connect(handler)
+        # 记住按钮，光标移动时同步「按下」状态（不然看不出有没有生效）
+        if not hasattr(self, "_tools"):
+            self._tools = {}
+        self._tools[text.replace(" ", "")] = button
         return button
 
     def _build_toolbar(self) -> QWidget:
-        bar = QWidget()
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        # 分栏变窄时工具条放不下 → 横向滚动，而不是叠在一起
+        bar = HScrollRow(height=36, spacing=6)
+        row = bar
 
         self.style_select = Select()
         self.style_select.setFixedWidth(112)
@@ -334,6 +349,46 @@ class MemosPage(QWidget):
             return
         self._sync_list_name()
         self._save_timer.start()
+        self._format_timer.start()
+
+    def _fix_uniform_title_format(self) -> None:
+        """整篇都被标题格式「污染」时（多行粘贴最常见），把第一行之后的恢复成正文。
+
+        只在「第一行之后的段落全是标题格式」时才动手，避免覆盖用户手动改过的某一行。
+        """
+        if self._loading or self._current_id is None:
+            return
+        from PySide6.QtGui import QTextFormat
+
+        document = self.editor.document()
+        blocks = []
+        block = document.firstBlock()
+        while block.isValid():
+            blocks.append(block)
+            block = block.next()
+        if len(blocks) < 3:          # 标题 + 至少两行正文才判断
+            return
+
+        def is_title_format(target) -> bool:
+            fragment = target.begin()
+            if fragment.atEnd():
+                return False
+            fmt = fragment.fragment().charFormat()
+            return (fmt.hasProperty(QTextFormat.Property.FontPointSize)
+                    and fmt.fontPointSize() >= TITLE_SIZE - 0.6
+                    and fmt.fontWeight() >= QFont.Weight.DemiBold)
+
+        rest = blocks[1:]
+        if not all(is_title_format(item) for item in rest):
+            return
+        self._loading = True
+        try:
+            for target_block in rest:
+                self._format_block(target_block, self._body_format())
+        finally:
+            self._loading = False
+        self._save_timer.start()
+        self.status.setText("已把标题之后的内容恢复成正文格式")
 
     def _sync_list_name(self) -> None:
         """列表里的名字：没填自定义名称时，跟着正文第一行走。"""
@@ -360,28 +415,42 @@ class MemosPage(QWidget):
                 item.title_label.setText(title)
 
     # -------------------------------------------------- 文字格式
-    def _merge(self, fmt: QTextCharFormat) -> None:
+    def _target_name(self) -> str:
+        """状态提示用：选中了几个字 / 当前段落。"""
         cursor = self.editor.textCursor()
+        count = len(cursor.selectedText()) if cursor.hasSelection() else 0
+        return f"所选 {count} 个字" if count else "当前段落"
+
+    def _merge(self, fmt: QTextCharFormat, label: str = "") -> None:
+        cursor = self.editor.textCursor()
+        if not cursor.hasSelection():
+            # 没选中就作用在当前段落上，否则「点了一下但看不出来」
+            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
         cursor.mergeCharFormat(fmt)
         self.editor.mergeCurrentCharFormat(fmt)
         self.editor.setFocus()
+        if label:
+            self.status.setText(f"已把「{label}」应用到{self._target_name()}")
+        self._sync_toolbar_state()
 
     def _toggle_bold(self) -> None:
         current = self.editor.textCursor().charFormat()
+        bold = current.fontWeight() < 600
         fmt = QTextCharFormat()
-        fmt.setFontWeight(QFont.Weight.Normal if current.fontWeight() >= 600
-                          else QFont.Weight.DemiBold)
-        self._merge(fmt)
+        fmt.setFontWeight(QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
+        self._merge(fmt, "加粗" if bold else "取消加粗")
 
     def _toggle_italic(self) -> None:
+        italic = not self.editor.textCursor().charFormat().fontItalic()
         fmt = QTextCharFormat()
-        fmt.setFontItalic(not self.editor.textCursor().charFormat().fontItalic())
-        self._merge(fmt)
+        fmt.setFontItalic(italic)
+        self._merge(fmt, "斜体" if italic else "取消斜体")
 
     def _toggle_underline(self) -> None:
+        underline = not self.editor.textCursor().charFormat().fontUnderline()
         fmt = QTextCharFormat()
-        fmt.setFontUnderline(not self.editor.textCursor().charFormat().fontUnderline())
-        self._merge(fmt)
+        fmt.setFontUnderline(underline)
+        self._merge(fmt, "下划线" if underline else "取消下划线")
 
     def _on_style(self, _index: int = -1) -> None:
         """一键套用字号/字重：作用于选中段落（或光标所在段落）。"""
@@ -403,6 +472,40 @@ class MemosPage(QWidget):
             self.editor.setTextCursor(cursor)
         self.editor.mergeCurrentCharFormat(fmt)
         self.editor.setFocus()
+        self.status.setText(f"已套用「{name}」（{int(size)} pt）到{self._target_name()}")
+        self._sync_toolbar_state()
+
+    def _sync_toolbar_state(self) -> None:
+        """让工具栏跟着光标走：B/I/U 是否按下、字号、样式下拉。"""
+        if getattr(self, "_loading", False) or not hasattr(self, "_tools"):
+            return
+        try:
+            fmt = self.editor.textCursor().charFormat()
+            for key, active in (("B", fmt.fontWeight() >= 600),
+                                ("I", bool(fmt.fontItalic())),
+                                ("U", bool(fmt.fontUnderline()))):
+                button = self._tools.get(key)
+                if button is not None:
+                    button.setKind("subtle" if active else "ghost")
+            size = fmt.fontPointSize()
+            if size > 0 and getattr(self, "size_select", None) is not None:
+                index = min(range(len(FONT_SIZES)),
+                            key=lambda i: abs(FONT_SIZES[i] - size))
+                self.size_select.blockSignals(True)
+                self.size_select.setCurrentIndex(index)
+                self.size_select.blockSignals(False)
+            if getattr(self, "style_select", None) is not None:
+                bold = fmt.fontWeight() >= 600
+                match = "自定义"
+                for name, (value, _weight) in STYLE_SIZES.items():
+                    if abs(size - value) < 0.6 and (name == "正文") != bold:
+                        match = name
+                        break
+                self.style_select.blockSignals(True)
+                self.style_select.setCurrentIndex(STYLE_ITEMS.index(match))
+                self.style_select.blockSignals(False)
+        except Exception:
+            pass
 
     def _on_size(self, _index: int = -1) -> None:
         try:
@@ -411,7 +514,7 @@ class MemosPage(QWidget):
             return
         fmt = QTextCharFormat()
         fmt.setFontPointSize(size)
-        self._merge(fmt)
+        self._merge(fmt, f"字号 {int(size)} pt")
 
     def _pick_color(self) -> None:
         color = QColorDialog.getColor(QColor(theme.TEXT), self, "选择文字颜色")
@@ -419,7 +522,7 @@ class MemosPage(QWidget):
             return
         fmt = QTextCharFormat()
         fmt.setForeground(color)
-        self._merge(fmt)
+        self._merge(fmt, "文字颜色")
 
     def _pick_highlight(self) -> None:
         color = QColorDialog.getColor(QColor(theme.soft(theme.ACCENT, 0.25)), self,
@@ -428,7 +531,7 @@ class MemosPage(QWidget):
             return
         fmt = QTextCharFormat()
         fmt.setBackground(color)
-        self._merge(fmt)
+        self._merge(fmt, "高亮")
 
     def _toggle_list(self, ordered: bool) -> None:
         cursor = self.editor.textCursor()
@@ -440,12 +543,15 @@ class MemosPage(QWidget):
             block_format.setIndent(0)
             block_format.setObjectIndex(-1)
             cursor.setBlockFormat(block_format)
+            self.status.setText("已取消列表")
         else:
             list_format = QTextListFormat()
             list_format.setStyle(style)
             list_format.setIndent(1)
             cursor.createList(list_format)
+            self.status.setText("已改成列表")
         self.editor.setFocus()
+        self._sync_toolbar_state()
 
     def _insert_todo(self) -> None:
         """给光标行加待办圆圈；有选区时给每一行都加上。"""
@@ -471,7 +577,6 @@ class MemosPage(QWidget):
         self.editor.setFocus()
 
     def _clear_format(self) -> None:
-        cursor = self.editor.textCursor()
         fmt = QTextCharFormat()
         fmt.setFontWeight(QFont.Weight.Normal)
         fmt.setFontItalic(False)
@@ -479,7 +584,7 @@ class MemosPage(QWidget):
         fmt.setForeground(QColor(theme.TEXT))
         fmt.setBackground(Qt.BrushStyle.NoBrush)
         fmt.setFontPointSize(BODY_SIZE)
-        self._merge(fmt)
+        self._merge(fmt, "清除格式（回到正文）")
 
     # -------------------------------------------------- 待办勾选
     def _editor_mouse_press(self, event):
@@ -609,11 +714,39 @@ class MemosPage(QWidget):
         """在标题行按回车时，接着写的那一行默认是正文。"""
         from PySide6.QtCore import Qt as _Qt
 
+        # 粘贴：按「当前是哪一行」套格式，避免粘贴进来的多行继承标题的大字号
+        try:
+            if event.matches(QKeySequence.StandardKey.Paste):
+                self._paste_as_plain()
+                return
+        except Exception:
+            pass
         is_return = event.key() in (_Qt.Key.Key_Return, _Qt.Key.Key_Enter)
         in_title = self.editor.textCursor().block().blockNumber() == 0
         QTextEdit.keyPressEvent(self.editor, event)
         if is_return and in_title:
             self._after_enter()
+
+    def _paste_as_plain(self) -> None:
+        """粘贴纯文本：标题行里贴的算标题，其余算正文。"""
+        from PySide6.QtWidgets import QApplication
+
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            cursor.removeSelectedText()
+        in_title = cursor.block().blockNumber() == 0
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        for index, line in enumerate(lines):
+            if index:
+                cursor.insertBlock()
+            fmt = self._title_format() if (in_title and index == 0) else self._body_format()
+            cursor.insertText(line, fmt)
+        self.editor.setTextCursor(cursor)
+        self.editor.setCurrentCharFormat(self._body_format())
+        self.editor.setFocus()
 
     def hideEvent(self, event):
         self._save_current()

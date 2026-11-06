@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import icons, notices, theme
+from .utils import open_external
 from .widgets import Card, Pill, SoftButton, ToggleSwitch, make_scroll
 from .widgets_filter import MultiSelectFilter
 
@@ -74,7 +75,7 @@ class NoticeRow(QWidget):
     def mouseReleaseEvent(self, event):
         url = str(self.notice.get("url", ""))
         if event.button() == Qt.MouseButton.LeftButton and url:
-            QDesktopServices.openUrl(QUrl(url))
+            open_external(url)
         super().mouseReleaseEvent(event)
 
 

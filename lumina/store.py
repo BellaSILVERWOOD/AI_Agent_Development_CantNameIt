@@ -26,6 +26,99 @@ def compute_remind_at(date_str: str, start_time: str, minutes: Optional[int]) ->
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+REPEAT_KINDS = ("", "daily", "weekly", "monthly", "yearly")
+
+
+def normalize_repeat(value) -> str:
+    """把界面/导入来的重复规则规整成 ''/daily/weekly/monthly/yearly。"""
+    text = str(value or "").strip().lower()
+    aliases = {
+        "": "", "none": "", "never": "", "不重复": "", "0": "",
+        "day": "daily", "daily": "daily", "每天": "daily", "每日": "daily",
+        "week": "weekly", "weekly": "weekly", "每周": "weekly", "每星期": "weekly",
+        "month": "monthly", "monthly": "monthly", "每月": "monthly",
+        "year": "yearly", "yearly": "yearly", "每年": "yearly",
+    }
+    if text in aliases:
+        return aliases[text]
+    return "" if text not in REPEAT_KINDS else text
+
+
+def _add_months(year: int, month: int, day: int) -> Optional[str]:
+    """下个月的同一个「几号」；那个月没有这一天（比如 31 号）就返回 None。"""
+    month += 1
+    if month > 12:
+        month = 1
+        year += 1
+    try:
+        return datetime(year, month, day).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def recurrence_days(start_date: str, repeat: str, start: str, end: str,
+                    limit: int = 400) -> List[str]:
+    """把「从哪一天开始、按什么规则重复」展开成 [start, end] 区间里的日期。
+
+    * daily：每天；weekly：每 7 天（同一个星期几）；
+    * monthly：每月同一个「几号」，没有那一天的月份跳过（1/31 → 3/31、5/31…）；
+    * yearly：每年同月同日，2/29 只在闰年出现。
+    """
+    repeat = normalize_repeat(repeat)
+    if not repeat:
+        return []
+    try:
+        begin = datetime.strptime(str(start_date)[:10], "%Y-%m-%d")
+        low = datetime.strptime(str(start)[:10], "%Y-%m-%d")
+        high = datetime.strptime(str(end)[:10], "%Y-%m-%d")
+    except ValueError:
+        return []
+    if high < begin:
+        return []
+    days: List[str] = []
+    if repeat == "daily":
+        cursor = max(begin, low)
+        while cursor <= high and len(days) < limit:
+            days.append(cursor.strftime("%Y-%m-%d"))
+            cursor += timedelta(days=1)
+        return days
+    if repeat == "weekly":
+        cursor = begin
+        if cursor < low:
+            cursor += timedelta(days=7 * ((low - cursor).days // 7))
+            while cursor < low:
+                cursor += timedelta(days=7)
+        while cursor <= high and len(days) < limit:
+            days.append(cursor.strftime("%Y-%m-%d"))
+            cursor += timedelta(days=7)
+        return days
+    if repeat == "monthly":
+        year, month = begin.year, begin.month
+        while (year, month) <= (high.year, high.month) and len(days) < limit:
+            try:
+                occurrence = datetime(year, month, begin.day)
+            except ValueError:
+                occurrence = None
+            if occurrence is not None and occurrence >= begin \
+                    and low <= occurrence <= high:
+                days.append(occurrence.strftime("%Y-%m-%d"))
+            month += 1
+            if month > 12:
+                month, year = 1, year + 1
+        return days
+    # yearly
+    for year in range(begin.year, high.year + 1):
+        try:
+            occurrence = datetime(year, begin.month, begin.day)
+        except ValueError:
+            continue          # 2/29 在平年跳过
+        if occurrence >= begin and low <= occurrence <= high:
+            days.append(occurrence.strftime("%Y-%m-%d"))
+        if len(days) >= limit:
+            break
+    return days
+
+
 class Store:
     """所有界面共享的数据库访问对象（单连接，主线程使用）。"""
 
@@ -61,6 +154,9 @@ class Store:
                 notified INTEGER NOT NULL DEFAULT 0,
                 done INTEGER NOT NULL DEFAULT 0,
                 color TEXT NOT NULL DEFAULT 'violet',
+                repeat TEXT NOT NULL DEFAULT '',
+                repeat_skip TEXT NOT NULL DEFAULT '',
+                repeat_until TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -135,10 +231,26 @@ CREATE TABLE IF NOT EXISTS important_dates (
         self._migrate()
 
     def _migrate(self) -> None:
-        """老库补列：events.group_id（日程所属分组）、notices.published_at（网页上的发布时间）。"""
+        """老库补列：events.group_id（日程所属分组）、events.repeat（重复规则）、
+        notices.published_at（网页上的发布时间）。"""
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(events)")}
         if "group_id" not in columns:
             self.conn.execute("ALTER TABLE events ADD COLUMN group_id INTEGER")
+            self.conn.commit()
+        if "repeat" not in columns:
+            # 重复规则：'' 不重复 / daily / weekly / monthly / yearly
+            self.conn.execute(
+                "ALTER TABLE events ADD COLUMN repeat TEXT NOT NULL DEFAULT ''")
+            self.conn.commit()
+        if "repeat_skip" not in columns:
+            # 跳过的那几次（逗号分隔的日期），用于「删除本次」
+            self.conn.execute(
+                "ALTER TABLE events ADD COLUMN repeat_skip TEXT NOT NULL DEFAULT ''")
+            self.conn.commit()
+        if "repeat_until" not in columns:
+            # 重复到哪一天为止（空 = 一直重复），用于「删除后续」
+            self.conn.execute(
+                "ALTER TABLE events ADD COLUMN repeat_until TEXT NOT NULL DEFAULT ''")
             self.conn.commit()
         notice_columns = {
             row["name"] for row in self.conn.execute("PRAGMA table_info(notices)")}
@@ -164,7 +276,7 @@ CREATE TABLE IF NOT EXISTS important_dates (
             "theme_accent": "#2F7A5F",
             "theme_accent2": "#D99A4E",
             "theme_bg": "linen",
-            "theme_alpha": "0.78",
+            "theme_alpha": "0.98",
             "theme_glass": "1",
             "theme_blur": "24",
             "seeded": "0",
@@ -342,16 +454,18 @@ CREATE TABLE IF NOT EXISTS important_dates (
         color: str = "violet",
         done: bool = False,
         group_id=None,
+        repeat: str = "",
     ) -> int:
         ts = now_str()
+        repeat = normalize_repeat(repeat)
         remind_at = compute_remind_at(date, start_time, remind_minutes)
         cur = self.conn.execute(
             "INSERT INTO events(title, description, date, start_time, end_time, remind_minutes,"
-            " remind_at, notified, done, color, group_id, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " remind_at, notified, done, color, group_id, repeat, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 title.strip(), description, date, start_time, end_time, remind_minutes,
-                remind_at, 0, 1 if done else 0, color, group_id, ts, ts,
+                remind_at, 0, 1 if done else 0, color, group_id, repeat, ts, ts,
             ),
         )
         self.conn.commit()
@@ -360,8 +474,10 @@ CREATE TABLE IF NOT EXISTS important_dates (
     def update_event(self, event_id: int, **fields: Any) -> None:
         allowed = {
             "title", "description", "date", "start_time", "end_time",
-            "remind_minutes", "color", "done", "group_id",
+            "remind_minutes", "color", "done", "group_id", "repeat",
         }
+        if "repeat" in fields:
+            fields["repeat"] = normalize_repeat(fields["repeat"])
         fields = {k: v for k, v in fields.items() if k in allowed}
         if not fields:
             return
@@ -393,6 +509,42 @@ CREATE TABLE IF NOT EXISTS important_dates (
         row = self.conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         return self._event_row(row) if row else None
 
+    def skip_occurrence(self, event_id: int, day: str) -> None:
+        """「删除本次」：把这一天记进 repeat_skip，其余照常重复。"""
+        row = self.get_event(event_id)
+        if row is None:
+            return
+        day = str(day or "")[:10]
+        if not day:
+            return
+        skips = [part.strip() for part in str(row.get("repeat_skip") or "").split(",")
+                 if part.strip()]
+        if day not in skips:
+            skips.append(day)
+        self.conn.execute("UPDATE events SET repeat_skip = ?, updated_at = ?"
+                          " WHERE id = ?", (",".join(sorted(skips)), now_str(),
+                                            int(event_id)))
+        self.conn.commit()
+
+    def end_repeat_before(self, event_id: int, day: str) -> None:
+        """「删除后续」：让重复在这一天之前就结束（这一天及以后都不再出现）。"""
+        row = self.get_event(event_id)
+        if row is None:
+            return
+        day = str(day or "")[:10]
+        first = str(row.get("date") or "")[:10]
+        if not day or day <= first:
+            self.delete_event(int(event_id))     # 从第一次就不想要了 = 全删
+            return
+        try:
+            until = (datetime.strptime(day, "%Y-%m-%d")
+                     - timedelta(days=1)).strftime("%Y-%m-%d")
+        except ValueError:
+            until = day
+        self.conn.execute("UPDATE events SET repeat_until = ?, updated_at = ?"
+                          " WHERE id = ?", (until, now_str(), int(event_id)))
+        self.conn.commit()
+
     def delete_event(self, event_id: int) -> None:
         self.conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
         self.conn.commit()
@@ -423,11 +575,45 @@ CREATE TABLE IF NOT EXISTS important_dates (
         self.conn.commit()
 
     def events_between(self, start: str, end: str) -> List[Dict[str, Any]]:
+        """区间里的日程（含**重复日程**展开出来的每一次）。
+
+        重复日程只在库里存一条「母事件」（repeat 非空），这里按规则把落在区间里的
+        日期展开成多条，每条带 `repeat_of`（母事件 id），界面照常当普通日程画。
+        """
         rows = self.conn.execute(
-            "SELECT * FROM events WHERE date BETWEEN ? AND ? ORDER BY date, start_time, id",
+            "SELECT * FROM events WHERE (repeat IS NULL OR repeat = '')"
+            " AND date BETWEEN ? AND ? ORDER BY date, start_time, id",
             (start, end),
         ).fetchall()
-        return [self._event_row(r) for r in rows]
+        items = [self._event_row(r) for r in rows]
+        try:
+            masters = self.conn.execute(
+                "SELECT * FROM events WHERE repeat IS NOT NULL AND repeat != ''"
+                " AND date <= ? ORDER BY date, start_time, id", (end,)).fetchall()
+        except Exception:
+            masters = []
+        for row in masters:
+            master = self._event_row(row)
+            skip = {part.strip() for part in str(master.get("repeat_skip") or "").split(",")
+                    if part.strip()}
+            until = str(master.get("repeat_until") or "")[:10]
+            for day in recurrence_days(master.get("date") or "",
+                                       master.get("repeat") or "", start, end):
+                if until and day > until:
+                    continue
+                if day in skip:
+                    continue                  # 这一次被单独删掉了
+                if day == master.get("date"):
+                    items.append(master)      # 母事件本身那天只算一次
+                    continue
+                occurrence = dict(master)
+                occurrence["date"] = day
+                occurrence["repeat_of"] = master.get("id")
+                items.append(occurrence)
+        items.sort(key=lambda it: (str(it.get("date") or ""),
+                                   str(it.get("start_time") or ""),
+                                   int(it.get("id") or 0)))
+        return items
 
     def events_on(self, date: str) -> List[Dict[str, Any]]:
         return self.events_between(date, date)
@@ -441,16 +627,18 @@ CREATE TABLE IF NOT EXISTS important_dates (
     def counts_between(self, start: str, end: str,
                        exclude_group_ids: Optional[List[int]] = None) -> Dict[str, int]:
         """区间内的日程数；可以排除某些分组（比如课程表导入的课）。"""
-        sql = ("SELECT COUNT(*) AS total, COALESCE(SUM(done), 0) AS done"
-               " FROM events WHERE date BETWEEN ? AND ?")
-        params: List[Any] = [start, end]
-        excluded = [int(value) for value in (exclude_group_ids or [])]
-        if excluded:
-            placeholders = ",".join("?" for _ in excluded)
-            sql += f" AND (group_id IS NULL OR group_id NOT IN ({placeholders}))"
-            params.extend(excluded)
-        row = self.conn.execute(sql, params).fetchone()
-        return {"total": int(row["total"]), "done": int(row["done"])}
+        excluded = {int(value) for value in (exclude_group_ids or [])}
+        total = done = 0
+        for item in self.events_between(start, end):
+            try:
+                group_id = int(item.get("group_id") or 0)
+            except (TypeError, ValueError):
+                group_id = 0
+            if group_id and group_id in excluded:
+                continue
+            total += 1
+            done += 1 if item.get("done") else 0
+        return {"total": total, "done": done}
 
     def task_candidates(self, days_back: int = 30, days_forward: int = 14) -> List[Dict[str, Any]]:
         today = datetime.now().date()

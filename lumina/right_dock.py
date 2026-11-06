@@ -1,4 +1,4 @@
-﻿"""右侧 dock：把「最近日程」和「AI」放在同一个可折叠侧栏里，用顶部小标签切换。
+"""右侧 dock：把「最近日程」和「AI」放在同一个可折叠侧栏里，用顶部小标签切换。
 
 * 标签：日程 / AI
 * 右侧箭头：整列收起成一条窄栏（记住状态，存 settings 的 dock_open / dock_tab）
@@ -38,7 +38,7 @@ class RightDock(QWidget):
         self.store = store
         self._open = (store.get_setting(DOCK_OPEN_KEY, "1") or "1") != "0"
         tab = (store.get_setting(DOCK_TAB_KEY, "agenda") or "agenda").strip()
-        self._tab = tab if tab in ("agenda", "ai") else "agenda"
+        self._tab = tab if tab in ("agenda", "ai", "lit") else "agenda"
         try:
             stored = int(float(store.get_setting(DOCK_WIDTH_KEY, "") or EXPANDED_WIDTH))
         except Exception:
@@ -70,6 +70,10 @@ class RightDock(QWidget):
                                  point_size=8.4)
         self.ai_tab.clicked.connect(lambda: self.set_tab("ai"))
         head_row.addWidget(self.ai_tab)
+        self.lit_tab = SoftButton("文献", "subtle", height=26, min_width=56,
+                                  point_size=8.4)
+        self.lit_tab.clicked.connect(lambda: self.set_tab("lit"))
+        head_row.addWidget(self.lit_tab)
         head_row.addStretch(1)
         self.swap_button = IconButton(icons.SWAP, size=26, glyph_size=11,
                                       tip="与中间栏互换（内容搬到大区域）")
@@ -91,6 +95,10 @@ class RightDock(QWidget):
         self.stack.addWidget(self.agenda)
         self.ai = AiPage(store, compact=True)
         self.stack.addWidget(self.ai)
+        from .lit_panel import LiteraturePanel
+
+        self.lit = LiteraturePanel(store, compact=True)
+        self.stack.addWidget(self.lit)
         root.addWidget(self.stack, 1)
 
         # 收起状态：一条窄栏
@@ -179,6 +187,26 @@ class RightDock(QWidget):
     def preferred_width(self) -> int:
         return max(MIN_WIDTH, min(MAX_WIDTH, self._width))
 
+    def set_user_width(self, width: int, save: bool = False) -> int:
+        """外部拖拽条改宽度：夹到合法范围、立刻生效，可选写回设置。"""
+        try:
+            value = int(width)
+        except (TypeError, ValueError):
+            return self.width()
+        self._width = max(MIN_WIDTH, min(MAX_WIDTH, value))
+        if self._open and not self._primary and not self._fullscreen:
+            self.setFixedWidth(self._width)
+        try:
+            self.width_changed.emit(self.width())
+        except Exception:
+            pass
+        if save:
+            try:
+                self.store.set_setting(DOCK_WIDTH_KEY, str(self._width))
+            except Exception:
+                pass
+        return self._width
+
     # -------------------------------------------------- 拖宽度
     def _in_handle(self, x: float) -> bool:
         return self._open and not self._fullscreen and 0 <= x <= HANDLE
@@ -240,7 +268,12 @@ class RightDock(QWidget):
         self.rail.setVisible(not self._open)
         self.agenda_tab.setKind("primary" if self._tab == "agenda" else "subtle")
         self.ai_tab.setKind("primary" if self._tab == "ai" else "subtle")
-        self.stack.setCurrentIndex(0 if self._tab == "agenda" else 1)
+        try:
+            self.lit_tab.setKind("primary" if self._tab == "lit" else "subtle")
+        except Exception:
+            pass
+        self.stack.setCurrentIndex(0 if self._tab == "agenda"
+                                  else (2 if self._tab == "lit" else 1))
         if self._primary and not self._fullscreen:
             self.setMinimumWidth(0)
             self.setMaximumWidth(16777215)
@@ -289,7 +322,7 @@ class RightDock(QWidget):
         return self._open
 
     def set_tab(self, tab: str) -> None:
-        if tab not in ("agenda", "ai"):
+        if tab not in ("agenda", "ai", "lit"):
             return
         self._tab = tab
         self.store.set_setting(DOCK_TAB_KEY, tab)
@@ -304,6 +337,17 @@ class RightDock(QWidget):
 
     def show_agenda(self) -> None:
         self.set_tab("agenda")
+
+    def show_lit(self) -> None:
+        self.set_tab("lit")
+
+    def search_literature(self, text: str) -> None:
+        """从「文献库」页把关键词送到右侧「文献」标签，并立刻联网检索。"""
+        self.set_tab("lit")
+        try:
+            self.lit.search_for(str(text or ""))
+        except Exception:
+            pass
 
     def current_tab(self) -> str:
         return self._tab

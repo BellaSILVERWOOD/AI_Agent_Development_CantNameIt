@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 本地运行数据与开发截图
+data/
+shots/
+tools/*.log
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 系统文件
+Thumbs.db
+.DS_Store

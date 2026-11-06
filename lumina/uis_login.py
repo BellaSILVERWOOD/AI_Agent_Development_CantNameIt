@@ -73,60 +73,242 @@ def is_login_url(url: str) -> bool:
 
 
 # ------------------------------------------------------------------ 自动填表
+# 新版 UIS（id.fudan.edu.cn）是前端框架渲染的单页应用，踩过的坑：
+# * 页面在 `load` 之后还会重渲染一次，早早填进去的值会被框架抹掉；
+# * 只设 `el.value` 不行，框架的响应式数据不会更新（于是提交时提示「用户名不能为空」）；
+# * 有的入口把登录框放在 iframe 里。
+# 所以这里：① 连 iframe 一起找；② 用原生 setter + input/change/keyup 事件让框架认；
+# ③ 填完**校验真的写进去了**；④ 只有校验通过才点「登录」；⑤ 交给 Python 侧多重试几次。
 AUTOFILL_JS = r"""
 (function(){
-  var user = __USER__, pwd = __PWD__;
-  function setValue(el, value){
-    if (!el) return false;
-    el.focus();
-    var proto = Object.getPrototypeOf(el);
-    var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-    if (desc && desc.set) { desc.set.call(el, value); }
-    else { el.value = value; }
-    el.dispatchEvent(new Event('input', {bubbles:true}));
-    el.dispatchEvent(new Event('change', {bubbles:true}));
-    el.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true}));
+  var user = __USER__, pwd = __PWD__, wantClick = __CLICK__;
+  function docs(){
+    var out = [document];
+    try {
+      var frames = document.querySelectorAll('iframe, frame');
+      for (var i = 0; i < frames.length; i++){
+        try {
+          var d = frames[i].contentDocument;
+          if (d) out.push(d);
+        } catch (e) {}
+      }
+    } catch (e) {}
+    return out;
+  }
+  function nativeSet(el, value){
+    try {
+      var desc = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value');
+      if (desc && desc.set) { desc.set.call(el, value); }
+      else { el.value = value; }
+    } catch (e) { try { el.value = value; } catch (e2) { return false; } }
+    try {
+      el.dispatchEvent(new InputEvent('input', {bubbles: true, data: value,
+                                                inputType: 'insertText'}));
+    } catch (e) {
+      el.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    el.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: 'a'}));
+    try { el.dispatchEvent(new Event('blur', {bubbles: true})); } catch (e) {}
     return true;
   }
-  var inputs = Array.prototype.slice.call(document.querySelectorAll('input'));
-  var userInput = null, pwdInput = null;
-  for (var i = 0; i < inputs.length; i++){
-    var el = inputs[i];
+  function visible(el){
+    try {
+      var r = el.getBoundingClientRect();
+      if (r.width < 16 || r.height < 8) { return false; }
+      var s = getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+    } catch (e) { return true; }
+  }
+  function editable(el){
+    if (!el || el.readOnly || el.disabled) { return false; }
     var type = (el.type || '').toLowerCase();
-    if (type === 'password' && !pwdInput) pwdInput = el;
-    if (!userInput && (type === 'text' || type === 'tel' || type === 'email' || !type)){
-      userInput = el;
-    }
+    if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file']
+        .indexOf(type) >= 0) { return false; }
+    return visible(el);
   }
-  var filledUser = setValue(userInput, user);
-  var filledPwd = setValue(pwdInput, pwd);
-  if (!pwdInput) return JSON.stringify({ok:false, reason:'没找到密码输入框', url:location.href});
-  // 点登录：优先文案匹配，其次 submit 按钮
+  function blob(el){
+    var parts = [el.getAttribute('name'), el.id, el.getAttribute('placeholder'),
+                 el.getAttribute('aria-label'), el.getAttribute('autocomplete'),
+                 el.getAttribute('title'),
+                 (el.form && (el.form.id || el.form.className)) || ''];
+    return parts.join(' ').toLowerCase();
+  }
+  // 给「账号框」打分：像账号的加分，像语言切换 / 搜索的狠狠减分
+  function score(el){
+    var b = blob(el), s = 0;
+    if (/user|account|login|学号|工号|账号|用户|uname/.test(b)) { s += 6; }
+    if (el.getAttribute('autocomplete') === 'username') { s += 6; }
+    if (/lang|language|locale|语言/i.test(b)) { s -= 12; }
+    if (/search|搜索|query|filter/i.test(b)) { s -= 8; }
+    if ((el.type || '').toLowerCase() === 'search') { s -= 4; }
+    return s;
+  }
+  function before(a, b){
+    try {
+      return !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    } catch (e) { return true; }
+  }
+  function norm(text){
+    return String(text || '').replace(/\s+/g, '').toLowerCase();
+  }
+  function shown(el){
+    try {
+      var s = getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+    } catch (e) { return true; }
+  }
+  function looksLogin(node){
+    var t = norm(node.innerText || node.value || node.textContent);
+    if (!t || t.length > 12) { return false; }
+    return /^(登录|登陆|login|signin|submit|提交|确定|下一步|next)$/.test(t);
+  }
+  function pressEnter(el){
+    var opts = {bubbles: true, cancelable: true, key: 'Enter', code: 'Enter',
+                keyCode: 13, which: 13};
+    try { el.dispatchEvent(new KeyboardEvent('keydown', opts)); } catch (e) {}
+    try { el.dispatchEvent(new KeyboardEvent('keypress', opts)); } catch (e) {}
+    try { el.dispatchEvent(new KeyboardEvent('keyup', opts)); } catch (e) {}
+  }
+  function clickNodes(nodes, exact){
+    for (var i = 0; i < nodes.length; i++){
+      var node = nodes[i];
+      try {
+        if (!node || node.disabled) { continue; }
+        if (!shown(node)) { continue; }
+        var text = norm(node.innerText || node.value || node.textContent);
+        if (exact) {
+          if (text !== '登录' && text !== '登陆' && text !== 'login'
+              && text !== 'signin') { continue; }
+        } else if (!looksLogin(node)) { continue; }
+        node.click();
+        return true;
+      } catch (e) {}
+    }
+    return false;
+  }
+  function clickLogin(found){
+    // ① 真按钮 / 链接（最短路径，也不会点到包着按钮的容器）
+    var real = 'button, a, input[type="submit"], input[type="button"], '
+      + 'input[type="image"], div[role="button"], [role="button"]';
+    var nodes = [];
+    try {
+      nodes = Array.prototype.slice.call(found.doc.querySelectorAll(real));
+    } catch (e) { nodes = []; }
+    if (clickNodes(nodes, false)) { return true; }
+    // ② 按 class 猜（login / submit / btn）
+    var byClass = '';
+    try {
+      byClass = '[class*="login"], [class*="Login"], [class*="submit"], '
+        + '[class*="btn"], [id*="login"], [id*="Login"], [id*="submit"]';
+      nodes = Array.prototype.slice.call(found.doc.querySelectorAll(byClass));
+    } catch (e) { nodes = []; }
+    if (clickNodes(nodes, false)) { return true; }
+    // ③ 整棵树上找「文字就是登录」的元素（span 套在 div 里的常见写法）
+    var all = [];
+    try { all = Array.prototype.slice.call(found.doc.querySelectorAll('*')); }
+    catch (e) { all = []; }
+    if (clickNodes(all, true)) { return true; }
+    // 再退一步：在密码框上按回车（很多登录表单只监听回车）
+    try { found.p.focus(); } catch (e) {}
+    pressEnter(found.p);
+    pressEnter(found.u);
+    // 最后：直接提交表单（老式页面）
+    try {
+      var form = found.p.form;
+      if (form && form.requestSubmit) { form.requestSubmit(); return true; }
+      if (form) { form.submit(); return true; }
+    } catch (e) {}
+    return false;
+  }
+  function findFields(doc){
+    var all = [];
+    try { all = Array.prototype.slice.call(doc.querySelectorAll('input')); }
+    catch (e) { return null; }
+    var passwords = all.filter(function(el){
+      return (el.type || '').toLowerCase() === 'password' && editable(el);
+    });
+    if (!passwords.length) {
+      // 有的页面密码框写成 type=text（或者 contenteditable），只能看名字
+      passwords = all.filter(function(el){
+        return editable(el) && /pwd|password|密码/.test(blob(el));
+      });
+    }
+    for (var k = 0; k < passwords.length; k++) {
+      var p = passwords[k];
+      var scope = p.form;
+      if (!scope) {
+        var node = p.parentElement;
+        for (var d = 0; d < 6 && node; d++) {
+          try {
+            if (node.querySelectorAll &&
+                node.querySelectorAll('input').length > 1) { scope = node; break; }
+          } catch (e) {}
+          node = node.parentElement;
+        }
+      }
+      if (!scope) { scope = doc; }
+      var pool = all;
+      try {
+        var scoped = Array.prototype.slice.call(scope.querySelectorAll('input'));
+        if (scoped.length > 1) { pool = scoped; }
+      } catch (e) {}
+      var cands = [];
+      for (var m = 0; m < pool.length; m++) {
+        var el2 = pool[m];
+        if (el2 === p || !editable(el2)) { continue; }
+        var type2 = (el2.type || '').toLowerCase();
+        if (type2 && ['text', 'tel', 'email', 'number', 'search']
+            .indexOf(type2) < 0) { continue; }
+        if (!before(el2, p)) { continue; }        // 只要密码框前面的
+        cands.push(el2);
+      }
+      if (!cands.length) { continue; }
+      var best = null, bestScore = -1e9;
+      for (var n = 0; n < cands.length; n++) {
+        var sc = score(cands[n]);
+        if (sc > bestScore) { bestScore = sc; best = cands[n]; }
+      }
+      if (bestScore <= 0) {
+        // 都看不出是账号框：取「紧挨着密码框、在它前面」的那个
+        best = cands[cands.length - 1];
+      }
+      if (best) { return {doc: doc, u: best, p: p, score: bestScore}; }
+    }
+    return null;
+  }
+  var found = null;
+  var all = docs();
+  for (var d = 0; d < all.length && !found; d++){
+    found = findFields(all[d]);
+  }
+  if (!found) { return JSON.stringify({ok: false, reason: '没找到账号密码输入框', url: location.href}); }
+  try { found.u.focus(); } catch (e) {}
+  nativeSet(found.u, user);
+  try { found.p.focus(); } catch (e) {}
+  nativeSet(found.p, pwd);
+  var userOk = (found.u.value === user);
+  var pwdOk = (found.p.value === pwd);
+  if (!userOk || !pwdOk){
+    return JSON.stringify({ok: false, reason: '登录框没接受输入（页面可能刚刷新，正在重试）',
+                           userOk: userOk, pwdOk: pwdOk, url: location.href});
+  }
   var clicked = false;
-  var nodes = Array.prototype.slice.call(document.querySelectorAll('button, a, div[role="button"], input[type="submit"]'));
-  for (var j = 0; j < nodes.length; j++){
-    var text = (nodes[j].innerText || nodes[j].value || '').replace(/\s+/g, '');
-    if (/^(登录|登陆|login|提交|确定)$/i.test(text)) {
-      nodes[j].click();
-      clicked = true;
-      break;
-    }
+  if (wantClick){
+    clicked = clickLogin(found);
   }
-  if (!clicked) {
-    var form = pwdInput.form;
-    if (form) { form.submit(); clicked = true; }
-  }
-  return JSON.stringify({ok:true, user:filledUser, pwd:filledPwd, clicked:clicked, url:location.href});
+  return JSON.stringify({ok: true, clicked: clicked, url: location.href});
 })()
 """
 
 
-def autofill_script(store) -> str:
+def autofill_script(store, click: bool = True) -> str:
     """生成注入用的 JS（账号密码做 JSON 转义，安全）。"""
     data = credentials(store)
     return (AUTOFILL_JS
             .replace("__USER__", json.dumps(data["username"]))
-            .replace("__PWD__", json.dumps(data["password"])))
+            .replace("__PWD__", json.dumps(data["password"]))
+            .replace("__CLICK__", "true" if click else "false"))
 
 
 # ------------------------------------------------------------------ 后台直连（旧的）

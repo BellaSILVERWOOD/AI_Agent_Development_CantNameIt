@@ -20,19 +20,24 @@ CACHE_DIR = DATA_DIR / "latex_math"
 BUILD_DIR = DATA_DIR / "latex_build" / "math"
 
 
-def cache_key(latex: str, display: bool = False) -> str:
-    raw = ("d:" if display else "i:") + (latex or "")
+def cache_key(latex: str, display: bool = False, dpi: int = 220,
+              color: str = "") -> str:
+    raw = "%s%s|%d|%s" % ("d:" if display else "i:", latex or "", int(dpi),
+                          (color or "").lower())
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-def cached_png(latex: str, display: bool = False) -> Optional[str]:
-    path = CACHE_DIR / f"{cache_key(latex, display)}.png"
+def cached_png(latex: str, display: bool = False, dpi: int = 220,
+               color: str = "") -> Optional[str]:
+    path = CACHE_DIR / f"{cache_key(latex, display, dpi, color)}.png"
     return str(path) if path.exists() else None
 
 
-def _math_document(latex: str, display: bool) -> str:
+def _math_document(latex: str, display: bool, color: str = "") -> str:
     # standalone + preview 对「行间公式环境」支持不好，统一用行内数学 + \displaystyle
     body = ("$\\displaystyle " + latex + "$") if display else ("$" + latex + "$")
+    if color:
+        body = "\\color[HTML]{%s}%s" % (color.lstrip("#").upper(), body)
     return (
         "\\documentclass[12pt,border=2pt]{standalone}\n"
         "\\usepackage{amsmath,amssymb,bm}\n"
@@ -43,16 +48,15 @@ def _math_document(latex: str, display: bool) -> str:
     )
 
 
-def render(latex: str, display: bool = False, dpi: int = 220) -> Optional[str]:
-    """渲染公式为 PNG，返回路径；失败返回 None。"""
+def compile_pdf(latex: str, display: bool = False,
+                color: str = "") -> Optional[str]:
+    """只跑 xelatex 出 PDF（**不碰 Qt**），给后台线程用。
+
+    返回 PDF 路径；失败返回 None。PDF 放在 `latex_build/math/<随机名>/` 下。
+    """
     latex = (latex or "").strip()
     if not latex:
         return None
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    target = CACHE_DIR / f"{cache_key(latex, display)}.png"
-    if target.exists():
-        return str(target)
-
     engine = find_engine("xelatex")
     if not engine:
         return None
@@ -60,7 +64,7 @@ def render(latex: str, display: bool = False, dpi: int = 220) -> Optional[str]:
     work = BUILD_DIR / uuid.uuid4().hex[:8]
     work.mkdir(parents=True, exist_ok=True)
     tex = work / "math.tex"
-    tex.write_text(_math_document(latex, display), encoding="utf-8")
+    tex.write_text(_math_document(latex, display, color), encoding="utf-8")
     commands = [
         [engine, "-interaction=nonstopmode", "-halt-on-error",
          "-disable-installer", "-output-directory=" + str(work), tex.name],
@@ -80,15 +84,40 @@ def render(latex: str, display: bool = False, dpi: int = 220) -> Optional[str]:
             continue
         if pdf.exists():
             break
-    if not pdf.exists():
-        return None
+    return str(pdf) if pdf.exists() else None
 
-    image = _pdf_to_image(str(pdf), dpi)
+
+def png_from_pdf(pdf_path: str, latex: str, display: bool = False,
+                 dpi: int = 220, color: str = "") -> Optional[str]:
+    """把 PDF 第一页转成 PNG 并写进缓存（**必须在有 QGuiApplication 的线程**里跑）。"""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    target = CACHE_DIR / f"{cache_key(latex, display, dpi, color)}.png"
+    if target.exists():
+        return str(target)
+    image = _pdf_to_image(str(pdf_path), dpi)
     if image is None:
         return None
-    if image.save(str(target), "PNG"):
+    return str(target) if image.save(str(target), "PNG") else None
+
+
+def render(latex: str, display: bool = False, dpi: int = 220,
+           color: str = "") -> Optional[str]:
+    """渲染公式为 PNG，返回路径；失败返回 None。
+
+    `dpi` 越大越清晰（默认 220；插入文档时用 360 再按字号缩小，看着才不糊）；
+    `color` 是公式文字颜色（深色主题下要传亮色，否则黑字糊在黑底上）。
+    """
+    latex = (latex or "").strip()
+    if not latex:
+        return None
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    target = CACHE_DIR / f"{cache_key(latex, display, dpi, color)}.png"
+    if target.exists():
         return str(target)
-    return None
+    pdf = compile_pdf(latex, display, color)
+    if not pdf:
+        return None
+    return png_from_pdf(pdf, latex, display, dpi, color)
 
 
 def _pdf_to_image(pdf_path: str, dpi: int):

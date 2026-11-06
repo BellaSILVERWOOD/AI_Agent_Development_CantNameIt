@@ -1,7 +1,7 @@
 ﻿"""专注模式：小浮窗计时器 + 离开提醒 + 白名单。
 
 * 点侧边栏「专注模式」开始，桌面上会出现一个悬浮计时器（可拖动）；
-* 每 5 秒看一眼前台窗口：只要前台不是 Lumina、也不在白名单里，就开始累计「离开时间」；
+* 每 5 秒看一眼前台窗口：只要前台不是 DanLume、也不在白名单里，就开始累计「离开时间」；
 * 离开超过阈值（默认 5 分钟）就弹提醒，提醒后会安静一阵，避免连环弹窗；
 * 白名单可以填进程名（chrome.exe）或窗口标题里的关键词（canvas.fudan.edu.cn）。
 
@@ -526,7 +526,7 @@ class FocusMonitor(QObject):
     """盯着前台窗口，离开太久就发出提醒。"""
 
     away_alert = Signal(int)          # 离开了多少分钟
-    focus_changed = Signal(bool)      # 是否在专注（前台在 Lumina 或白名单）
+    focus_changed = Signal(bool)      # 是否在专注（前台在 DanLume 或白名单）
 
     def __init__(self, store, timer_window: FocusTimer, parent=None):
         super().__init__(parent)

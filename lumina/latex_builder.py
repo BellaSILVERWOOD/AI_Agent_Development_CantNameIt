@@ -301,9 +301,12 @@ def build_document(body: str, package_ids: Optional[Iterable[str]] = None,
                    options: str = "a4paper,12pt", extra_preamble: str = "") -> str:
     ids = DEFAULT_PACKAGES if package_ids is None else list(package_ids)
     head = (
-        "% 由 Lumina 的公式编辑器生成\n"
+        "% 由 DanLume 的公式编辑器生成\n"
         "\\documentclass[" + options + "]{" + document_class + "}\n"
         + preamble(ids, extra_preamble) + "\n"
+        # 段落样式跟编辑区对齐：不缩进首行、段与段之间留一点空（Word 的感觉）
+        "\\setlength{\\parindent}{0pt}\n"
+        "\\setlength{\\parskip}{0.62em}\n"
     )
     return head + "\n\\begin{document}\n\n" + (body or "") + "\n\n\\end{document}\n"
 

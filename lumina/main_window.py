@@ -7,16 +7,16 @@ import time
 from typing import Optional
 
 from PySide6.QtCore import (
-    QDate, QEasingCurve, QPoint, QPropertyAnimation, QRect, QRectF, QSize, Qt,
-    QTimer, Signal,
+    QAbstractAnimation, QDate, QEasingCurve, QPoint, QPropertyAnimation, QRect,
+    QRectF, QSize, Qt, QTimer, Signal,
 )
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QGuiApplication, QKeySequence,
     QLinearGradient, QPainter, QPainterPath, QPen, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QSizePolicy, QStackedWidget, QVBoxLayout,
-    QWidget,
+    QApplication, QHBoxLayout, QLabel, QMenu, QSizePolicy, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
 from . import icons, theme, win_effects
@@ -27,6 +27,7 @@ from .page_calendar import CalendarPage
 from .page_latex import LatexPage
 from .page_docs import DocsPage
 from .page_ehall import EhallPage
+from .page_lit import LiteraturePage
 from .page_homework import HomeworkPage
 from .page_memos import MemosPage
 from .page_notices import NoticesPage
@@ -46,9 +47,9 @@ from .theme import (
 )
 from .utils import iso, weekday_cn
 from .widgets import (
-    Card, EventDetailPane, IconButton, NavButton, ShadowPanel, SnackBar,
-    SoftButton, WindowButton,
-    icon_font, rounded_path,
+    Card, EventDetailPane, IconButton, NavButton, PaneSplitter, ShadowPanel,
+    SnackBar, SoftButton, WindowButton,
+    icon_font, rounded_path, round_menu,
 )
 
 
@@ -178,7 +179,7 @@ class TitleBar(QWidget):
         self.sidebar_button.clicked.connect(lambda: window.toggle_sidebar())
         layout.addWidget(self.sidebar_button)
         layout.addWidget(LogoMark(30))
-        brand = QLabel("Lumina")
+        brand = QLabel("DanLume")
         brand_font = QFont(self.font())
         brand_font.setPointSizeF(11.6)
         brand_font.setWeight(QFont.Weight.DemiBold)
@@ -194,16 +195,17 @@ class TitleBar(QWidget):
         layout.addStretch(1)
 
         dark = theme.is_dark()
-        # 用文字而不是图标：这两个开关是“显示/隐藏中栏、右栏”，图标容易看不懂
+        # 用文字而不是图标：这两个开关是「左/右那一栏显示不显示」，图标容易看不懂
+        # 注意：按「位置」而不是「角色」——互换布局后右边那一栏是页面，左边那栏是日程/AI
         self.middle_button = SoftButton("中栏", "ghost", height=26, min_width=44,
                                         point_size=8.4)
-        self.middle_button.setToolTip("显示 / 隐藏中间栏（Ctrl+Alt+M）")
-        self.middle_button.clicked.connect(lambda: window.toggle_middle())
+        self.middle_button.setToolTip("显示 / 隐藏左边这一栏（Ctrl+Alt+M）")
+        self.middle_button.clicked.connect(lambda: window.toggle_pane_slot("left"))
         layout.addWidget(self.middle_button)
         self.right_button = SoftButton("右栏", "ghost", height=26, min_width=44,
                                        point_size=8.4)
-        self.right_button.setToolTip("显示 / 隐藏右侧栏（Ctrl+Alt+R）")
-        self.right_button.clicked.connect(lambda: window.toggle_dock())
+        self.right_button.setToolTip("显示 / 隐藏右边这一栏（Ctrl+Alt+R）")
+        self.right_button.clicked.connect(lambda: window.toggle_pane_slot("right"))
         layout.addWidget(self.right_button)
         layout.addSpacing(4)
 
@@ -226,7 +228,11 @@ class TitleBar(QWidget):
         self.min_button.clicked.connect(window.showMinimized)
         self.max_button = WindowButton(icons.MAXIMIZE, tip="最大化")
         self.max_button.clicked.connect(window.toggle_maximize)
-        self.close_button = WindowButton(icons.CLOSE, danger=True, tip="关闭")
+        self.close_button = WindowButton(
+            icons.CLOSE, danger=True,
+            tip=("收进托盘（右键托盘图标可退出）"
+                 if getattr(window, "tray_available", lambda: False)()
+                 else "关闭"))
         self.close_button.clicked.connect(window.close)
         layout.addWidget(self.min_button)
         layout.addWidget(self.max_button)
@@ -236,16 +242,20 @@ class TitleBar(QWidget):
         self.max_button.set_glyph(icons.RESTORE if maximized else icons.MAXIMIZE)
         self.max_button.setToolTip("还原" if maximized else "最大化")
 
-    def set_pane_states(self, middle: bool, dock: bool) -> None:
-        """中栏 / 右栏按钮：开着的显示 ✕（点了就是关），关着的只显示名字（点了打开）。"""
-        self.middle_button.setKind("subtle" if middle else "ghost")
-        self.middle_button.setText("中栏 ✕" if middle else "中栏")
+    def set_pane_states(self, left: bool, right: bool) -> None:
+        """左边那栏 / 右边那栏的按钮：开着的显示 ✕（点了就是关），关着的只显示名字。
+
+        `left` / `right` 说的是**屏幕上的位置**，不是「中栏 / 右栏」这两个角色：
+        互换布局后左边是日程/AI、右边是页面，这里的 ✕ 关的也得跟着换。
+        """
+        self.middle_button.setKind("subtle" if left else "ghost")
+        self.middle_button.setText("中栏 ✕" if left else "中栏")
         self.middle_button.setToolTip(
-            "关闭中间栏（Ctrl+Alt+M）" if middle else "打开中间栏（Ctrl+Alt+M）")
-        self.right_button.setKind("subtle" if dock else "ghost")
-        self.right_button.setText("右栏 ✕" if dock else "右栏")
+            "关闭左边这一栏（Ctrl+Alt+M）" if left else "打开左边这一栏（Ctrl+Alt+M）")
+        self.right_button.setKind("subtle" if right else "ghost")
+        self.right_button.setText("右栏 ✕" if right else "右栏")
         self.right_button.setToolTip(
-            "关闭右侧栏（Ctrl+Alt+R）" if dock else "打开右侧栏（Ctrl+Alt+R）")
+            "关闭右边这一栏（Ctrl+Alt+R）" if right else "打开右边这一栏（Ctrl+Alt+R）")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -286,25 +296,28 @@ class Sidebar(QWidget):
         layout.setSpacing(3)
 
         layout.addWidget(self._section("导航"))
+        self.nav_dashboard = NavButton(icons.INFO, "仪表板")
         self.nav_calendar = NavButton(icons.CALENDAR, "日历")
         self.nav_mail = NavButton(icons.MAIL, "邮箱")
         self.nav_notices = NavButton(icons.BELL, "通知")
         self.nav_memos = NavButton(icons.DOCUMENT, "备忘")
         self.nav_homework = NavButton(icons.DOWNLOAD, "作业")
         self.nav_ehall = NavButton(icons.FOLDER, "eHall")
+        self.nav_classroom = NavButton(icons.CALENDAR, "空教室")
         self.nav_docs = NavButton(icons.DOCUMENT, "文档")
+        self.nav_lit = NavButton(icons.FOLDER, "文献库")
         self.nav_latex = NavButton(icons.EDIT, "公式")
         self.nav_ai = NavButton(icons.INFO, "AI")
         self.nav_ai.clicked.connect(self.ai_requested.emit)
-        self.nav_vpn = NavButton(icons.SWAP, "VPN / 代理")
-        self.nav_vpn.clicked.connect(self.vpn_requested.emit)
         self.nav_settings = NavButton(icons.SETTINGS, "设置")
-        self._nav_items = [self.nav_calendar, self.nav_mail, self.nav_notices,
-                           self.nav_memos, self.nav_homework, self.nav_ehall,
-                           self.nav_docs, self.nav_latex, self.nav_ai,
-                           self.nav_vpn, self.nav_settings]
-        # AI 不是页面（在右侧 dock 里），所以单独映射页面下标
-        page_map = [0, 1, 2, 3, 4, 5, 6, 7, None, None, 8]
+        self._nav_items = [self.nav_dashboard, self.nav_calendar, self.nav_mail,
+                           self.nav_notices, self.nav_memos, self.nav_homework,
+                           self.nav_ehall, self.nav_classroom, self.nav_docs,
+                           self.nav_lit, self.nav_latex, self.nav_ai,
+                           self.nav_settings]
+        # AI 不是页面（在右栏里），所以单独映射页面下标；
+        # 仪表板放在页面下标 10，导航里排第一；空教室是页面 11
+        page_map = [10, 0, 1, 2, 3, 4, 5, 11, 6, 9, 7, None, 8]
         for position, item in enumerate(self._nav_items):
             if page_map[position] is not None:
                 item.clicked.connect(
@@ -386,16 +399,28 @@ class Sidebar(QWidget):
             divider,
         )
 
-    # 导航栏位置：0..6 是页面 0..6，7 是 AI（右侧栏），8 是设置（页面 7）
-    PAGE_TO_NAV = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 10}
-    NAV_AI = 8
+    #: 导航位置：0 仪表板（页面 10）· 1 日历 · 2 邮箱 · 3 通知 · 4 备忘 · 5 作业
+    #:           6 eHall · 7 空教室（页面 11）· 8 文档 · 9 文献库（页面 9）·
+    #:           10 公式（页面 7）· 11 AI（右侧栏）· 12 设置（页面 8）
+    #: 页面下标 → 导航项位置（导航里多了「仪表板」「空教室」「文献库」，位置会跟页面下标错开）
+    PAGE_TO_NAV = {10: 0,       # 仪表板（页面 10）排在最上面
+                   0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6,
+                   11: 7,       # 空教室是页面 11，排在 eHall 后面
+                   6: 8,        # 文档
+                   9: 9,        # 文献库
+                   7: 10,       # 公式
+                   8: 12}       # 设置
+    #: AI 不是页面（在右侧 dock 里）
+    NAV_AI = 11
+    #: 以前侧栏有个「VPN / 代理」按钮，用户说去掉；VPN 现在只在 设置 → 其他 里配。
+    NAV_VPN = -1
 
     def set_active(self, index: int) -> None:
         for position, item in enumerate(self._nav_items):
             item.set_active(position == index)
 
     def set_active_page(self, page_index: int) -> None:
-        """按页面下标点亮导航项（设置是页面 7 但排在导航第 8 位）。"""
+        """按页面下标点亮导航项（导航顺序和页面下标不一定一致）。"""
         self.set_active(self.PAGE_TO_NAV.get(int(page_index), 0))
 
     def refresh_counts(self) -> None:
@@ -415,11 +440,20 @@ class Sidebar(QWidget):
 
 class MainWindow(QWidget):
     fullscreen_changed = Signal(bool)
+    deadlines_synced = Signal(dict)      # eLearning 截止时间写进日程之后
 
-    def __init__(self, store, parent=None, initial_page: int = 0,
+    def __init__(self, store, parent=None, initial_page: int = 10,
                  initial_date: Optional[QDate] = None, show_welcome: bool = True):
+        """initial_page 默认 10 = 仪表板（打开应用先看今天要做什么）。"""
         super().__init__(parent)
         self.store = store
+        # 提示气泡改成自己画（Qt 默认的会继承控件颜色，深色下就是「黑底深字」）
+        try:
+            from . import tooltip
+
+            tooltip.install(QApplication.instance())
+        except Exception:
+            pass
         self._margin = 18
         self._maximized = False
         self._restore_geometry: Optional[QRect] = None
@@ -440,6 +474,8 @@ class MainWindow(QWidget):
         self._backdrop_busy = False
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(make_app_icon())
+        # 系统托盘：点右上角「关闭」收进托盘，右键托盘图标才有「退出」
+        self._setup_tray()
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         # 分层窗口里的 Chromium 原生子窗口会被 Windows 判成“全透明区域”，
         # 结果是点击直接穿透到下面的程序。所以默认改成不透明窗口。
@@ -472,6 +508,13 @@ class MainWindow(QWidget):
         self.sidebar = Sidebar(store)
         content_layout.addWidget(self.sidebar)
 
+        # 多标签页必须在**建页面之前**打开：网页面板是在页面构造函数里建出来的，
+        # 以前放在后面才 set_tabs_enabled()，所以开关打开了也没用（重启也一样）。
+        try:
+            set_tabs_enabled(
+                (self.store.get_setting("browser_tabs", "0") or "0") == "1")
+        except Exception:
+            pass
         self.pages = QStackedWidget()
         self.calendar_page = CalendarPage(store)
         self.mailbox_page = MailboxPage(store)
@@ -479,13 +522,67 @@ class MainWindow(QWidget):
         self.notices_page = NoticesPage(store)
         self.memos_page = MemosPage(store)
         self.homework_page = HomeworkPage(store)
+        # eLearning 的登录态只能从运行中的浏览器里取（磁盘上的 Cookies 库被 Chromium 锁死）
+        try:
+            from . import elearning
+
+            elearning.set_profile_provider(
+                lambda: self.homework_page.web.profile())
+        except Exception:
+            pass
         self.ehall_page = EhallPage(store)
+        from .page_classroom import ClassroomPage
+
+        self.classroom_page = ClassroomPage(store)
         self.docs_page = DocsPage(store)
+        self.lit_page = LiteraturePage(store)
+        self.lit_page.ask_endnote_install.connect(self._ask_endnote_install)
         self.latex_page = LatexPage(store)
         self.settings_page = SettingsPage(store)
+        # 仪表板放在最后（页面下标 10），左侧导航里排在最上面
+        from .page_dashboard import DashboardPage
+
+        self.dashboard_page = DashboardPage(store)
+        try:
+            self.dashboard_page.open_ehall.connect(self._open_ehall_url)
+            self.dashboard_page.open_homework.connect(lambda: self.navigate(4))
+            self.dashboard_page.open_homework_url.connect(self._open_homework_url)
+            self.dashboard_page.open_classroom.connect(lambda: self.navigate(11))
+        except Exception:
+            pass
+        # 每天把 eLearning 的作业截止时间写进日程（已有的不重复加）
+        try:
+            self.deadlines_synced.connect(self._on_deadlines_synced)
+            self._deadlines_timer = QTimer(self)
+            self._deadlines_timer.setInterval(60 * 60 * 1000)   # 每小时看一眼
+            self._deadlines_timer.timeout.connect(self._maybe_sync_deadlines)
+            self._deadlines_timer.start()
+            QTimer.singleShot(15000, self._maybe_sync_deadlines)
+        except Exception:
+            pass
+        # 仪表板上的 ehall 卡片：借 ehall 网页面板的登录态，在后台取数
+        try:
+            from .ehall_bridge import EhallBridge
+
+            self.ehall_bridge = EhallBridge(
+                store, lambda: self.ehall_page.web.profile(), self)
+            self.dashboard_page.attach_bridge(self.ehall_bridge)
+            # 空教室页的时间轴也用同一个桥（信号是「校区, 教学楼, 教室」）
+            try:
+                self.classroom_page.query_requested.connect(
+                    lambda campus, building, room:
+                    self.ehall_bridge.classroom_query(building, room, "all",
+                                                      campus=campus))
+                self.ehall_bridge.classroom_ready.connect(
+                    self.classroom_page.apply_result)
+            except Exception:
+                pass
+        except Exception:
+            self.ehall_bridge = None
         for page in (self.calendar_page, self.mailbox_page, self.notices_page,
                      self.memos_page, self.homework_page, self.ehall_page,
-                     self.docs_page, self.latex_page, self.settings_page):
+                     self.docs_page, self.latex_page, self.settings_page,
+                     self.lit_page, self.dashboard_page, self.classroom_page):
             self.pages.addWidget(page)
         # 中栏可以是「页面」也可以是「一张日程详情卡片」
         self.middle_stack = QStackedWidget()
@@ -503,6 +600,13 @@ class MainWindow(QWidget):
         self.dock.width_changed.connect(self._on_agenda_width)
         self.agenda = self.dock.agenda
         content_layout.addWidget(self.dock)
+        # 中栏 / 右栏之间的拖拽条（悬停变左右箭头，拖动实时改宽度）
+        self.pane_splitter = PaneSplitter(base=self.dock.width())
+        self.pane_splitter.grabbed.connect(self._on_pane_split_begin)
+        self.pane_splitter.dragged.connect(self._on_pane_split_drag)
+        self.pane_splitter.released.connect(self._on_pane_split_finish)
+        self.pane_splitter.reset_requested.connect(self._on_pane_split_reset)
+        content_layout.addWidget(self.pane_splitter)
         # 尾巴上的占位：两栏都关掉、只剩左栏时把多余宽度吸走，
         # 这样左栏还贴在左边，不会飘到中间去
         self.pane_tail = QWidget()
@@ -519,6 +623,46 @@ class MainWindow(QWidget):
         # 专注模式：悬浮计时器 + 离开提醒
         self.focus_timer = FocusTimer(store)
         self.focus_timer.clicked.connect(self.focus_timer.toggle_pause)
+        # 让 agent 的 pomodoro_start 工具能真的把专注计时开起来（GUI 线程）
+        try:
+            from . import agent_write
+
+            agent_write.set_pomodoro_handler(self._start_focus_from_agent)
+        except Exception:
+            pass
+        # agent 的 library_open：在应用内的网页里打开数据库搜索页
+        try:
+            from . import agent_web
+
+            agent_web.set_open_handler(self.open_web_url)
+        except Exception:
+            pass
+        # agent 的 mail_send：弹「可编辑 + 确认」的窗口（用户要求能改）
+        try:
+            from . import agent_mail
+
+            agent_mail.set_compose_handler(self._compose_from_agent)
+        except Exception:
+            pass
+        # agent 搜到文献时，**自动出现在右侧「文献」面板里**（用户要求列在边栏）
+        try:
+            from . import literature
+
+            literature.set_results_handler(self._on_literature_results)
+        except Exception:
+            pass
+        # 「文献库」页上的搜索框只过滤本机文献；点「联网检索」把关键词送到右侧「文献」
+        try:
+            self.lit_page.set_online_search_handler(self.dock.search_literature)
+        except Exception:
+            pass
+        # 客户端直接连过来送注册申请时，弹个提示（不用一直去翻邮箱）
+        try:
+            from . import registration
+
+            registration.set_incoming_handler(self._on_register_incoming)
+        except Exception:
+            pass
         self.focus_monitor = FocusMonitor(store, self.focus_timer, self)
         self.focus_monitor.away_alert.connect(self._on_away_alert)
         self.focus_timer.finished.connect(self._on_focus_finished)
@@ -530,11 +674,6 @@ class MainWindow(QWidget):
         self.refresh_all()
         if initial_date is not None:
             self.calendar_page.select_date(initial_date)
-        try:
-            set_tabs_enabled(
-                (self.store.get_setting("browser_tabs", "0") or "0") == "1")
-        except Exception:
-            pass
         try:
             self._middle_visible = (
                 (self.store.get_setting("pane_middle", "1") or "1") != "0")
@@ -550,6 +689,12 @@ class MainWindow(QWidget):
             self._apply_pane_layout()
         except Exception:
             self._panes_swapped = False
+        # 互换后用户自己拖出来的页面栏宽度（0 = 用默认）
+        try:
+            self._middle_user_width = int(
+                float(self.store.get_setting("middle_width", "0") or 0))
+        except Exception:
+            self._middle_user_width = 0
         # 启动时的 navigate 只是选页面，别把用户关掉的中栏又叫回来
         self._booting = True
         self.navigate(initial_page)
@@ -559,14 +704,302 @@ class MainWindow(QWidget):
         self.reminders.data_changed.connect(self.refresh_all)
         self.reminders.start()
 
+        # Agent 盯邮箱：指定发件人的新邮件 → 识别待办 → 等用户确认
+        try:
+            from .mail_watch import MailWatcher
+
+            self.mail_watch = MailWatcher(store, self)
+            self.mail_watch.found.connect(self._on_mail_watch_found)
+            self.mail_watch.start()
+        except Exception:
+            self.mail_watch = None
+
         # 教务通知监控
         self._notice_toasts = []
         self.notice_watcher = NoticeWatcher(store, self)
         self.notice_watcher.new_notices.connect(self._on_new_notices)
         self.notice_watcher.start()
 
+        # 使用情况上报（不走邮件）；管理员这份程序顺便起一个小监听
+        self._usage_started = time.time()
+        self.usage_server = None
+        try:
+            from . import usage_report
+
+            # AI 面板每完成一次调用就记一笔（TTFT / 出字速度）
+            panel = getattr(getattr(self.dock, "ai", None), "api_panel", None)
+            if panel is not None:
+                panel.ai_metrics.connect(self._on_ai_metrics)
+            self._usage_timer = QTimer(self)
+            self._usage_timer.setInterval(usage_report.interval_minutes(store) * 60_000)
+            self._usage_timer.timeout.connect(self._report_usage)
+            self._usage_timer.start()
+            QTimer.singleShot(20_000, self._report_usage)
+            from . import adminsign
+
+            if not adminsign.install_is_client(store):
+                server = usage_report.UsageServer(store)
+                if server.start():
+                    self.usage_server = server
+        except Exception:
+            pass
+
         if show_welcome:
             QTimer.singleShot(900, self._welcome)
+
+    # -------------------------------------------------- 使用情况上报
+    def _on_ai_metrics(self, metrics: Dict[str, Any]) -> None:
+        """每完成一次 API 调用就记一笔（时长 + TTFT + 出字速度）。"""
+        try:
+            from . import usage_report
+
+            usage_report.mark_activity(
+                store=self.store,
+                requests=1,
+                api_calls=1,
+                ttft=(metrics or {}).get("ttft"),
+                tok_s=(metrics or {}).get("tokens_per_second"))
+        except Exception:
+            pass
+
+    def _report_usage(self) -> None:
+        """后台线程发一份上报，回来后按管理员的处置动作提示 / 锁定。
+
+        省开销的两点：
+        * 只把「窗口真的露在外面」的时间算使用时长（最小化 / 隐藏时不算），
+          这样数字不变时 `usage_report.send` 会直接跳过，不发请求；
+        * 但每 3 个间隔（默认 30 分钟）强发一次心跳，管理员那边照样能看出在线。
+        """
+        import threading
+
+        elapsed = max(0.0, time.time() - getattr(self, "_usage_started", time.time()))
+        self._usage_started = time.time()
+        try:
+            active = bool(self.isVisible()) and not self.isMinimized()
+        except Exception:
+            active = True
+        seconds = elapsed if active else 0.0
+
+        def work() -> None:
+            try:
+                from . import usage_report
+
+                usage_report.mark_activity(store=self.store, seconds=seconds)
+                interval = usage_report.interval_minutes(self.store) * 60
+                last_ok = float(getattr(self, "_usage_last_ok", 0.0) or 0.0)
+                force = (time.time() - last_ok) > interval * 3
+                result = usage_report.send(self.store, force=force)
+                if result.get("ok"):
+                    self._usage_last_ok = time.time()
+                text = usage_report.apply_action(self.store, result)
+                if text:
+                    self._ui_notice(text)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, name="lumina-usage-report", daemon=True).start()
+
+    def _on_register_incoming(self, info) -> None:
+        """客户端直接 POST 过来的注册申请：提醒管理员去审核（不用翻邮箱）。"""
+        name = str((info or {}).get("username") or "（未知）")
+        try:
+            self.snackbar.show_message(
+                f"收到注册申请：{name}（网络直连）→ 设置 → 账户审核 → 检查新申请")
+        except Exception:
+            pass
+
+    def _on_literature_results(self, papers) -> None:
+        """agent 搜到文献：直接铺到右侧「文献」面板，并切过去让用户勾选。"""
+        items = [item for item in (papers or []) if item.get("id")]
+        if not items:
+            return
+        try:
+            self.dock.lit.set_papers(items)
+            self.dock.set_tab("lit")
+            self.snackbar.show_message(
+                f"找到 {len(items)} 篇相关文献：在右侧「文献」里勾选后可一键下载 / 引用")
+        except Exception:
+            pass
+        try:
+            self.notices_page.refresh_counts() if hasattr(
+                self.notices_page, "refresh_counts") else None
+        except Exception:
+            pass
+
+    def _compose_from_agent(self, payload) -> Optional[Dict[str, Any]]:
+        """agent 要发信：弹一个**可编辑**的确认窗口，返回用户改后的内容。"""
+        from PySide6.QtWidgets import QLabel, QLineEdit, QPlainTextEdit, QVBoxLayout
+
+        from .widgets import BaseDialog, SoftButton
+
+        data = dict(payload or {})
+        try:
+            dialog = BaseDialog(self, width=620, height=440, title="确认这封邮件",
+                                subtitle="AI 起草的邮件，你可以先改再发",
+                                icon=icons.MAIL)
+            body = QVBoxLayout()
+            body.setSpacing(6)
+            body.addWidget(QLabel("收件人"))
+            to_edit = QLineEdit(str(data.get("to") or ""))
+            body.addWidget(to_edit)
+            body.addWidget(QLabel("主题"))
+            subject_edit = QLineEdit(str(data.get("subject") or ""))
+            body.addWidget(subject_edit)
+            body.addWidget(QLabel("正文"))
+            text_edit = QPlainTextEdit(str(data.get("text") or ""))
+            text_edit.setMinimumHeight(180)
+            body.addWidget(text_edit)
+            dialog.body.addLayout(body)
+
+            cancel = SoftButton("取消", "ghost", height=34, min_width=80)
+            send = SoftButton("发送", "primary", height=34, min_width=100)
+            answer: Dict[str, Any] = {}
+
+            def do_send() -> None:
+                answer["value"] = {
+                    "to": to_edit.text().strip(),
+                    "subject": subject_edit.text().strip(),
+                    "text": text_edit.toPlainText(),
+                }
+                dialog.accept()
+
+            cancel.clicked.connect(dialog.reject)
+            send.clicked.connect(do_send)
+            dialog.add_footer([], [cancel, send])
+            dialog.exec()
+            return answer.get("value")
+        except Exception:
+            return None
+
+    def _open_ehall_url(self, url: str = "") -> None:
+        """仪表板里的 ehall 入口：切到 eHall 页并打开指定地址。"""
+        self.navigate(5)
+        target = str(url or "").strip()
+        if not target:
+            return
+        try:
+            self.ehall_page.web.load(target)
+        except Exception:
+            pass
+
+    def _open_homework_url(self, url: str = "") -> None:
+        """仪表板里的作业链接：切到「作业」页（eLearning）并打开这个地址。"""
+        self.navigate(4)
+        target = str(url or "").strip()
+        if not target:
+            return
+        try:
+            self.homework_page.web.load(target)
+        except Exception:
+            pass
+
+    # -------------------------------------------------- eLearning 截止 → 日程
+    def _maybe_sync_deadlines(self, force: bool = False) -> None:
+        """隔一天把 dash 里的作业截止写进日程（后台线程，别卡界面）。"""
+        import os
+
+        from . import elearn_schedule
+
+        if os.environ.get("LUMINA_SMOKE"):
+            return                     # 测试不联网
+        if not elearn_schedule.should_sync(self.store, force=force):
+            return
+        import threading
+
+        def work() -> None:
+            try:
+                result = elearn_schedule.sync(self.store, force=True)
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "added": 0, "skipped": 0,
+                          "error": "写日程失败：%s" % exc}
+            try:
+                self.deadlines_synced.emit(result)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, name="lumina-elearn-calendar",
+                         daemon=True).start()
+
+    def _on_deadlines_synced(self, result) -> None:
+        """写完之后刷新日历页，并在作业页说明结果。"""
+        from . import elearn_schedule
+
+        result = dict(result or {})
+        note = elearn_schedule.summary(result)
+        try:
+            if result.get("added"):
+                self.calendar_page.reload()
+        except Exception:
+            pass
+        try:
+            self.homework_page.subtitle.setText(note)
+        except Exception:
+            pass
+
+    def _ask_endnote_install(self, hint) -> None:
+        """没装 EndNote：问用户要不要现在去 ehall 装（用户要求）。"""
+        message = str((hint or {}).get("message") or "")
+        ask = str((hint or {}).get("ask") or "要不要现在带你到 ehall？")
+        try:
+            from .widgets import ConfirmDialog
+
+            dialog = ConfirmDialog(self, "要装 EndNote 吗？",
+                                   f"{message}\n\n{ask}", "带我去 ehall",
+                                   "先不用", danger=False)
+            dialog.exec()
+            if dialog.confirmed:
+                url = str((hint or {}).get("software") or "https://ehall.fudan.edu.cn/")
+                self.open_web_url(url)
+                self.snackbar.show_message("已在 eHall 网页里打开，登录后到「正版软件」下载安装")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.snackbar.show_message(f"打开 ehall 失败：{exc}")
+            except Exception:
+                pass
+
+    def open_web_url(self, url: str) -> bool:
+        """给 agent 的 library_open 用：在应用内的 eHall 网页里打开一个地址。
+
+        需要登录 / 人机验证的数据库页面就这样交给用户自己过验证。
+        """
+        text = str(url or "").strip()
+        if not text.lower().startswith(("http://", "https://")):
+            return False
+        try:
+            index = self.pages.indexOf(self.ehall_page)
+            if index < 0:
+                return False
+            self.navigate(index)
+            panel = getattr(self.ehall_page, "web", None)
+            if panel is None:
+                return False
+            panel.ensure_view()
+            panel.load(text)
+            return True
+        except Exception:
+            return False
+
+    def _start_focus_from_agent(self, minutes) -> bool:
+        """agent 的 pomodoro_start 工具调它：在 GUI 线程里真的开始专注计时。"""
+        try:
+            value = float(minutes or 25)
+
+            def start() -> None:
+                try:
+                    self.focus_timer.start(value)
+                except Exception:
+                    self.focus_timer.start()
+
+            QTimer.singleShot(0, start)
+            return True
+        except Exception:
+            return False
+
+    def _ui_notice(self, text: str) -> None:
+        try:
+            self.snackbar.show_message(text)
+        except Exception:
+            pass
 
     # -------------------------------------------------- 连接
     def _wire(self) -> None:
@@ -603,11 +1036,15 @@ class MainWindow(QWidget):
             ("Ctrl+7", lambda: self.navigate(6)),
             ("Ctrl+8", lambda: self.navigate(7)),
             ("Ctrl+9", lambda: self.navigate(8)),
+            ("Ctrl+0", lambda: self.navigate(9)),      # 文献库
             ("Ctrl+Shift+A", self.show_ai_panel),
             ("Ctrl+Shift+G", self.open_agent),
             ("Ctrl+Shift+L", self.swap_panes),
             ("Ctrl+R", self.refresh_all),
             ("Esc", self._on_escape),
+            # 按位置开合左右两栏（和标题栏那两个 ✕ 一致）
+            ("Ctrl+Alt+M", lambda: self.toggle_pane_slot("left")),
+            ("Ctrl+Alt+R", lambda: self.toggle_pane_slot("right")),
         ]
         for sequence, handler in entries:
             shortcut = QShortcut(QKeySequence(sequence), self)
@@ -616,10 +1053,22 @@ class MainWindow(QWidget):
 
     # -------------------------------------------------- 导航
     def navigate(self, index: int) -> None:
-        index = max(0, min(8, int(index)))
+        index = max(0, min(self.pages.count() - 1, int(index)))
         self.middle_stack.setCurrentWidget(self.pages)
         self.pages.setCurrentIndex(index)
         self.sidebar.set_active_page(index)
+        # 切到文献库就顺手刷一下（下载/导出之后能看到最新状态）
+        if index == 9:
+            try:
+                self.lit_page.reload()
+            except Exception:
+                pass
+        # 切到仪表板就把天气/日程刷新一遍（缓存 10 分钟，不会频繁联网）
+        if index == 10:
+            try:
+                self.dashboard_page.refresh()
+            except Exception:
+                pass
         # 点导航就把中栏叫回来（否则被关掉之后看起来像“界面不见了”）
         # 但启动时的那一次不算，否则关掉中栏后重启又自己冒出来
         if (not getattr(self, "_booting", False)
@@ -631,6 +1080,56 @@ class MainWindow(QWidget):
     def _on_agenda_width(self, width: int) -> None:
         """右侧栏展开/收起（看板娘现在是独立桌面窗口，不受影响）。"""
         self._agenda_width = int(width)
+
+    # -------------------------------------------------- 分栏拖拽
+    def _on_pane_split_begin(self) -> None:
+        """按下拖拽条：记下起始宽度，整段拖拽都以它为基准。
+
+        拖的永远是**右边那一栏**（默认布局是日程 / AI，互换后是页面）：
+        鼠标往右 → 右边那栏变窄 → 分割线跟着鼠标往右走；往左则反过来。
+        """
+        if getattr(self, "_panes_swapped", False):
+            self._split_origin = int(self.middle_stack.width())
+        else:
+            self._split_origin = int(self.dock.width())
+        self.pane_splitter.set_base(self._split_origin)
+
+    def _on_pane_split_drag(self, target: int) -> None:
+        """拖拽中：实时改宽度，不写设置。"""
+        if getattr(self, "_panes_swapped", False):
+            try:
+                self.middle_stack.setFixedWidth(max(260, min(900, int(target))))
+            except Exception:
+                return
+            return
+        self.dock.set_user_width(int(target))
+
+    def _on_pane_split_finish(self, target: int) -> None:
+        """松手：固定住最终宽度，并把设置写回去。"""
+        if getattr(self, "_panes_swapped", False):
+            width = max(260, min(900, int(target)))
+            self._middle_user_width = width
+            try:
+                self.middle_stack.setFixedWidth(width)
+                self.store.set_setting("middle_width", str(width))
+            except Exception:
+                pass
+            return
+        self.dock.set_user_width(int(target), save=True)
+
+    def _on_pane_split_reset(self) -> None:
+        """双击拖拽条：恢复默认宽度。"""
+        try:
+            if getattr(self, "_panes_swapped", False):
+                self._middle_user_width = 0
+                self.store.set_setting("middle_width", "0")
+                self._apply_panes()
+            else:
+                self.dock.reset_width()   # 回到默认宽度并写回设置
+                self._apply_panes()
+        except Exception:
+            pass
+        self._on_pane_split_begin()
 
     def refresh_all(self) -> None:
         if self._closed:
@@ -747,6 +1246,29 @@ class MainWindow(QWidget):
 
     def _on_settings_saved(self) -> None:
         self.refresh_all()
+        watcher = getattr(self, "mail_watch", None)
+        if watcher is not None:
+            try:
+                watcher.restart()
+            except Exception:
+                pass
+
+    # -------------------------------------------------- 盯邮箱
+    def _on_mail_watch_found(self, mails, items) -> None:
+        """Agent 盯到邮件里的待办：弹确认窗口，用户确认才写日程。"""
+        try:
+            from .agent_dialog import AgentDialog
+            from .mail_watch import consume
+
+            dialog = AgentDialog(self.store, self)
+            subjects = "、".join(
+                str(mail.get("subject") or "")[:24] for mail in (mails or [])[:3])
+            dialog.present_items(items, note=f"来自邮箱：{subjects}")
+            dialog.changed.connect(self.refresh_all)
+            dialog.exec()
+            consume(self.store, list(mails or []))
+        except Exception:
+            pass
 
 
     # -------------------------------------------------- 磨砂玻璃
@@ -790,6 +1312,44 @@ class MainWindow(QWidget):
         win_effects.set_round_corners(hwnd, not self._maximized)
         win_effects.enable_system_shadow(hwnd, bool(self._glass_active)
                                          and not self._maximized)
+        # 不透明窗口不该是分层窗口（分层 + Chromium 原生子窗口会点击穿透）
+        self._keep_opaque()
+
+    def _fade_running(self) -> bool:
+        """启动淡入动画是否还在跑（跑着的时候窗口必须是分层的）。
+
+        加一个 1 秒的硬上限：动画万一没收到 finished（隐藏窗口 / 远程桌面等），
+        也不至于永远不敢把窗口恢复成「不透明」。
+        """
+        try:
+            started = float(getattr(self, "_fade_started_at", 0.0) or 0.0)
+            if started and time.monotonic() - started > 1.0:
+                return False
+            animation = getattr(self, "_fade_anim", None)
+            if animation is None:
+                return False
+            return animation.state() == QAbstractAnimation.State.Running
+        except Exception:
+            return False
+
+    def _keep_opaque(self) -> None:
+        """不透明窗口：确保不透明度是 1、并且没有残留的分层样式。
+
+        Qt 给窗口做 `setWindowOpacity` 动画时会加上 WS_EX_LAYERED，动画结束
+        不一定去掉；分层窗口 + Chromium 原生子窗口会出现「点击穿透到别的程序」，
+        所以这里反复兜一下（便宜且幂等）。
+        """
+        if getattr(self, "_translucent", False) or self._fade_running():
+            return
+        try:
+            if float(self.windowOpacity()) < 0.999:
+                self.setWindowOpacity(1.0)
+        except Exception:
+            pass
+        try:
+            win_effects.clear_layered(int(self.winId()))
+        except Exception:
+            pass
 
     def _refresh_backdrop(self) -> None:
         """抓取窗口背后的桌面并做模糊，作为磨砂背景。
@@ -797,6 +1357,7 @@ class MainWindow(QWidget):
         注意：抓屏在 GUI 线程跑，必须防重入——上一次还没抓完（窗口刚拖过、
         Chromium 正在合成）就不要再抓，否则会互相卡住，界面看起来像死掉。
         """
+        self._keep_opaque()
         if not self._glass_active:
             return
         if not self.isVisible() or self.isMinimized():
@@ -942,8 +1503,12 @@ class MainWindow(QWidget):
                 except Exception:
                     pass
 
-    def preview_appearance(self, message: str = "") -> None:
-        """就地应用当前外观设置（不重建窗口，可反复调用）。"""
+    def preview_appearance(self, message: str = "", refresh_pages: bool = True) -> None:
+        """就地应用当前外观设置（不重建窗口，可反复调用）。
+
+        `refresh_pages=False` 时只重刷主题与外壳，不重读各页面的数据 ——
+        设置页做「实时预览」时用这个，免得把用户正在填的表单重置掉。
+        """
         if getattr(self, "_reloading", False):
             return
         self._reloading = True
@@ -963,9 +1528,10 @@ class MainWindow(QWidget):
             except Exception:
                 pass
             # 各页面里缓存的颜色：能刷的就刷一遍
-            for page in (self.calendar_page, self.mailbox_page, self.notices_page,
-                         self.memos_page, self.homework_page, self.ehall_page,
-                         self.docs_page, self.latex_page, self.settings_page):
+            pages = (self.calendar_page, self.mailbox_page, self.notices_page,
+                     self.memos_page, self.homework_page, self.ehall_page,
+                     self.docs_page, self.latex_page, self.settings_page)
+            for page in (pages if refresh_pages else ()):
                 for method in ("refresh", "reload"):
                     handler = getattr(page, method, None)
                     if callable(handler):
@@ -979,7 +1545,10 @@ class MainWindow(QWidget):
                     self.snackbar.show_message(message, "success", 2400)
                 except Exception:
                     pass
-            self._nudge_webviews()
+            if refresh_pages:
+                # 实时预览（refresh_pages=False）不碰内嵌网页：那一步会去动 Chromium，
+                # 拖滑杆时没必要，也容易把界面拖慢
+                self._nudge_webviews()
         finally:
             self._backdrop_busy = False
             self._reloading = False
@@ -1207,6 +1776,30 @@ class MainWindow(QWidget):
         self._apply_panes()
         self._save_pane_state()
 
+    # -------------------------------------------------- 按「位置」开合（标题栏两个按钮）
+    def toggle_pane_slot(self, slot: str, value=None) -> None:
+        """按屏幕位置开关某一栏。
+
+        * 默认布局：左边是页面（中栏），右边是日程 / AI（右栏）；
+        * 互换布局：左边是日程 / AI，右边是页面。
+
+        标题栏那两个「中栏 ✕ / 右栏 ✕」说的就是屏幕上的位置，
+        所以互换之后它们作用的对象也要跟着换（否则点右边那个 ✕ 反而关掉了左边）。
+        """
+        swapped = bool(getattr(self, "_panes_swapped", False))
+        left = str(slot).lower().startswith("l")
+        # 左边那栏默认是页面；互换后左边是日程 / AI
+        if left:
+            if swapped:
+                self.toggle_dock(value)
+            else:
+                self.toggle_middle(value)
+        else:
+            if swapped:
+                self.toggle_middle(value)
+            else:
+                self.toggle_dock(value)
+
     def _save_pane_state(self) -> None:
         try:
             self.store.update_settings({
@@ -1232,29 +1825,34 @@ class MainWindow(QWidget):
         dock_visible = bool(getattr(self, "_dock_visible", True))
         swapped = bool(getattr(self, "_panes_swapped", False))
 
-        # 1) 顺序：默认 [sidebar, middle, dock]；互换后 [sidebar, dock, middle]
+        # 1) 顺序：默认 [sidebar, middle, splitter, dock]；
+        #    互换后 [sidebar, dock, splitter, middle]
         try:
             layout.removeWidget(self.middle_stack)
             layout.removeWidget(self.pages)
             layout.removeWidget(self.dock)
+            layout.removeWidget(self.pane_splitter)
             layout.removeWidget(self.pane_tail)
         except Exception:
             pass
         if swapped:
             layout.insertWidget(1, self.dock)
-            layout.insertWidget(2, self.middle_stack)
+            layout.insertWidget(2, self.pane_splitter)
+            layout.insertWidget(3, self.middle_stack)
         else:
             layout.insertWidget(1, self.middle_stack)
-            layout.insertWidget(2, self.dock)
+            layout.insertWidget(2, self.pane_splitter)
+            layout.insertWidget(3, self.dock)
         try:
             layout.addWidget(self.pane_tail)   # 永远排在最后
         except Exception:
             pass
 
-        # 2) 显隐
+        # 2) 显隐（两栏都在才有拖拽条）
         try:
             self.middle_stack.setVisible(middle)
             self.dock.setVisible(dock_visible)
+            self.pane_splitter.setVisible(bool(middle and dock_visible))
         except Exception:
             pass
 
@@ -1297,10 +1895,14 @@ class MainWindow(QWidget):
             pass
         try:
             if swapped and dock_visible and middle:
-                # 互换后页面缩到右侧窄列
-                self.middle_stack.setMinimumWidth(260)
-                self.middle_stack.setMaximumWidth(
-                    max(360, self.dock.preferred_width()))
+                # 互换后页面缩到右侧窄列（用户拖过就按拖出来的宽度）
+                user_width = int(getattr(self, "_middle_user_width", 0) or 0)
+                if user_width >= 260:
+                    self.middle_stack.setFixedWidth(min(900, user_width))
+                else:
+                    self.middle_stack.setMinimumWidth(260)
+                    self.middle_stack.setMaximumWidth(
+                        max(360, self.dock.preferred_width()))
             else:
                 self.middle_stack.setMinimumWidth(0)
                 self.middle_stack.setMaximumWidth(16777215)
@@ -1314,9 +1916,19 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-        # 5) 顶部两个开关的图标
+        # 5) 顶部两个开关的图标（按屏幕位置传：互换后左边是日程 / AI）
         try:
-            self.title_bar.set_pane_states(middle, dock_visible)
+            if swapped:
+                self.title_bar.set_pane_states(dock_visible, middle)
+            else:
+                self.title_bar.set_pane_states(middle, dock_visible)
+        except Exception:
+            pass
+
+        # 6) 排版变了 → 拖拽条的基准跟着刷新
+        try:
+            if middle and dock_visible and not self.pane_splitter.is_dragging():
+                self._on_pane_split_begin()
         except Exception:
             pass
 
@@ -1398,7 +2010,11 @@ class MainWindow(QWidget):
             self.dock.show_ai()
             ai = getattr(self.dock, "ai", None)
             if ai is not None:
-                ai.set_tab(2)          # TAB_API
+                open_api = getattr(ai, "open_api_chat", None)
+                if callable(open_api):
+                    open_api()          # 切到「API 服务」标签
+                else:
+                    ai.set_tab(0)
             self.sidebar.set_active(self.sidebar.NAV_AI)
             if (not getattr(self, "_panes_swapped", False)
                     and getattr(self, "_middle_visible", True)):
@@ -1526,7 +2142,7 @@ class MainWindow(QWidget):
         events = self.store.events_on(iso(QDate.currentDate()))
         if not cfg.is_configured():
             self.snackbar.show_message(
-                "欢迎使用 Lumina · 先在「设置」中配置发件邮箱即可发送汇报",
+                "欢迎使用 DanLume · 先在「设置」中配置发件邮箱即可发送汇报",
                 "warn", 4600,
             )
         elif events:
@@ -1602,16 +2218,30 @@ class MainWindow(QWidget):
         self.unsetCursor()
         super().leaveEvent(event)
 
+    def _after_fade_in(self) -> None:
+        """淡入结束：把窗口的不透明度定死为 1，并去掉可能残留的分层样式。"""
+        try:
+            self.setWindowOpacity(1.0)
+        except Exception:
+            pass
+        self._apply_window_frame()
+        try:
+            self.update()
+        except Exception:
+            pass
+
     def showEvent(self, event):
         super().showEvent(event)
         if not self._fade_done:
             self._fade_done = True
+            self._fade_started_at = time.monotonic()
             self.setWindowOpacity(0.0)
             animation = QPropertyAnimation(self, b"windowOpacity", self)
             animation.setDuration(220)
             animation.setStartValue(0.0)
             animation.setEndValue(1.0)
             animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            animation.finished.connect(self._after_fade_in)
             animation.start()
             self._fade_anim = animation
         self._apply_glass()
@@ -1625,8 +2255,155 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    # -------------------------------------------------- 系统托盘
+    def _build_tray_menu(self):
+        """托盘右键菜单：显示主窗口 / 退出（单独拆出来，方便没托盘时也能建）。"""
+        menu = round_menu(QMenu(self))
+        self._tray_show_action = menu.addAction("显示主窗口")
+        self._tray_show_action.triggered.connect(self.show_from_tray)
+        menu.addSeparator()
+        self._tray_quit_action = menu.addAction("退出 DanLume")
+        self._tray_quit_action.triggered.connect(self.quit_from_tray)
+        self._tray_menu = menu
+        return menu
+
+    def _setup_tray(self) -> None:
+        """系统托盘：点右上角「关闭」是收进托盘，右键托盘图标才有「退出」。"""
+        self._tray = None
+        self._tray_available = False
+        self._tray_hint_shown = False
+        self._quitting = False
+        try:
+            menu = self._build_tray_menu()
+        except Exception:
+            menu = None
+        if os.environ.get("LUMINA_SMOKE"):
+            return                      # 测试 / 冒烟：不建托盘，免得退出流程被改
+        try:
+            from PySide6.QtWidgets import QSystemTrayIcon
+
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return
+            tray = QSystemTrayIcon(self)
+            try:
+                tray.setIcon(self.windowIcon())
+            except Exception:
+                pass
+            tray.setToolTip("%s · 还在后台运行" % APP_TITLE.split("·")[0].strip())
+            if menu is not None:
+                tray.setContextMenu(menu)
+            tray.activated.connect(self._on_tray_activated)
+            tray.show()
+            self._tray = tray
+            self._tray_available = True
+        except Exception as exc:  # noqa: BLE001
+            self._tray_available = False
+            try:
+                from . import diag
+
+                diag._say("托盘不可用：%s" % exc)
+            except Exception:
+                pass
+
+    def tray_available(self) -> bool:
+        return bool(getattr(self, "_tray_available", False))
+
+    def tray_on_close(self) -> bool:
+        """点关闭时是不是该收进托盘（设置里可以关掉这个行为）。"""
+        try:
+            return (self.store.get_setting("tray_on_close", "1") or "1") == "1"
+        except Exception:
+            return True
+
+    def _on_tray_activated(self, reason) -> None:
+        try:
+            from PySide6.QtWidgets import QSystemTrayIcon
+
+            if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                          QSystemTrayIcon.ActivationReason.DoubleClick):
+                self.show_from_tray()
+        except Exception:
+            pass
+
+    def hide_to_tray(self) -> None:
+        """把窗口收进托盘（不退出程序）。"""
+        if not self.tray_available():
+            return
+        try:
+            self._saved_geometry = self.geometry()
+        except Exception:
+            self._saved_geometry = None
+        self.hide()
+        try:
+            self.mascot.set_on(False)
+        except Exception:
+            pass
+        tray = getattr(self, "_tray", None)
+        if tray is not None and not getattr(self, "_tray_hint_shown", False):
+            self._tray_hint_shown = True
+            try:
+                from PySide6.QtWidgets import QSystemTrayIcon
+
+                tray.showMessage(
+                    "DanLume 还在后台跑",
+                    "点托盘图标可以把窗口叫回来；右键图标 → 退出 DanLume。",
+                    QSystemTrayIcon.MessageIcon.Information, 4000)
+            except Exception:
+                pass
+
+    def show_from_tray(self) -> None:
+        """从托盘把窗口叫回来。"""
+        try:
+            if self.isMinimized():
+                self.showNormal()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_maximized", False) or (
+                    getattr(self, "_saved_geometry", None) is not None
+                    and self._maximized):
+                self.showMaximized()
+        except Exception:
+            pass
+        try:
+            self.mascot.set_on(
+                (self.store.get_setting("mascot_on", "1") or "1") != "0")
+        except Exception:
+            pass
+        try:
+            self._apply_glass()
+        except Exception:
+            pass
+
+    def quit_from_tray(self) -> None:
+        """真正退出（托盘右键菜单里那一项）。"""
+        self._quitting = True
+        try:
+            if self._tray is not None:
+                self._tray.hide()
+        except Exception:
+            pass
+        try:
+            self.show()
+        except Exception:
+            pass
+        self.close()
+
     def closeEvent(self, event):
+        # 点关闭 → 收进托盘（除非用户关掉了这个行为，或者托盘不可用）
+        if (not getattr(self, "_quitting", False)
+                and self.tray_available() and self.tray_on_close()):
+            try:
+                event.ignore()
+            except Exception:
+                pass
+            self.hide_to_tray()
+            return
         self._closed = True
+
         for timer in (getattr(self, "_backdrop_timer", None),
                       getattr(self, "_backdrop_poll", None)):
             try:
@@ -1660,11 +2437,20 @@ class MainWindow(QWidget):
 
     def _shutdown_web(self) -> None:
         """拆掉所有内嵌浏览器（否则退出会卡住）。"""
+        # 后台取数桥挂在 ehall 的 profile 上，得赶在 profile 之前收掉
+        bridge = getattr(self, "ehall_bridge", None)
+        shutdown = getattr(bridge, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                pass
         candidates = [
             getattr(self.homework_page, "web", None),
             getattr(self.dock.ai, "web", None),
             getattr(self.ehall_page, "web", None),
             getattr(self.notices_page, "web", None),
+            getattr(getattr(self, "classroom_page", None), "web", None),
             getattr(getattr(self, "settings_page", None), "web", None),
         ]
         for panel in candidates:

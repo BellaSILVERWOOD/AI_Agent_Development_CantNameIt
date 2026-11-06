@@ -72,6 +72,8 @@ def add(store, entry: Dict[str, Any]) -> int:
 
 
 def add_many(store, entries: List[Dict[str, Any]]) -> int:
+    # 新建库里 refs 表还不存在时，这里以前会直接 `no such table: refs`
+    ensure_schema(store)
     count = 0
     for entry in entries:
         title = str(entry.get("title") or "").strip()
@@ -166,7 +168,7 @@ def fetch_doi(doi: str, timeout: float = 10.0) -> Dict[str, Any]:
     if not doi:
         raise RuntimeError("DOI 是空的")
     response = requests.get(f"https://api.crossref.org/works/{doi}", timeout=timeout,
-                            headers={"User-Agent": "Lumina/1.0 (mailto:noreply@example.com)"})
+                            headers={"User-Agent": "DanLume/1.0 (mailto:noreply@example.com)"})
     if response.status_code >= 400:
         raise RuntimeError(f"Crossref 返回 {response.status_code}")
     message = (response.json() or {}).get("message") or {}

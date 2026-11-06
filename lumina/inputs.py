@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 
 from . import icons, theme
 from .config import COLOR_ORDER, EVENT_COLORS, REMIND_OPTIONS, WEEKDAY_SHORT
-from .theme import ACCENT, ACCENT2, BORDER, FAINT, INPUT_BG, MUTED, TEXT
+from .theme import ACCENT, ACCENT2, BORDER, FAINT, INPUT_BG, MUTED, TEXT, TEXT_SOFT
 from .utils import date_cn, month_label
 from .widgets import Select, ShadowPanel, SoftButton, icon_font, rounded_path
 

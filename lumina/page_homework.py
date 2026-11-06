@@ -14,10 +14,12 @@ from typing import Any, Dict, List
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QLineEdit, QStackedWidget, QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
 from . import elearning, icons, theme
+from .utils import open_external
 from .web_panel import EmbeddedWebPanel
 from .widgets import Card, Pill, SoftButton, make_scroll
 
@@ -30,6 +32,7 @@ class HomeworkPage(QWidget):
 
     data_changed = Signal()
     open_document = Signal(str)
+    deadlines_changed = Signal(str)   # 截止时间写进日程之后的提示
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
@@ -78,6 +81,22 @@ class HomeworkPage(QWidget):
                                         point_size=8.8)
         self.switch_button.clicked.connect(self.toggle_view)
         header.addWidget(self.switch_button)
+        # 把 dash 里的截止时间写进日程（已有的不重复加）；每天自动跑一次
+        from . import elearn_schedule
+
+        self.calendar_button = SoftButton("截止写入日程", "ghost", height=34,
+                                          min_width=118, point_size=8.8)
+        self.calendar_button.setToolTip(
+            "把 eLearning 的 dash 里每项作业的截止时间写进日历；"
+            "已经在日程里的不会重复添加")
+        self.calendar_button.clicked.connect(self.write_deadlines)
+        header.addWidget(self.calendar_button)
+        self.calendar_switch = QCheckBox("每天自动")
+        self.calendar_switch.setChecked(elearn_schedule.enabled(self.store))
+        self.calendar_switch.setToolTip(
+            "开着的话，应用每次启动 / 隔一天会自动抓一次 dash，把新的截止时间加进日程")
+        self.calendar_switch.toggled.connect(self._on_calendar_switch)
+        header.addWidget(self.calendar_switch)
         root.addLayout(header)
 
         filter_row = QHBoxLayout()
@@ -118,7 +137,92 @@ class HomeworkPage(QWidget):
         self.empty = QLabel("还没有读取课程：在网页里登录后点右上角「读取我的课程」")
         self.empty.setObjectName("Muted")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._restore_cache()
         self.reload()
+
+    # -------------------------------------------------- 上次读到的清单
+    def _restore_cache(self) -> bool:
+        """把上次读到的课程与作业整份恢复出来。
+
+        用户报过「我以前下载的那些作业哪儿去了」：这份清单以前只在内存里，
+        一关程序就空，看起来像作业全没了。现在读一次就存下来，重启先显示这份，
+        点「读取我的课程」再联网刷新。
+        """
+        try:
+            from . import dashboard
+
+            cached = dashboard.load_homework_cache(self.store)
+        except Exception:
+            return False
+        courses = list(cached.get("courses") or [])
+        if not courses:
+            return False
+        self._courses = courses
+        self._assignments = list(cached.get("assignments") or [])
+        when = str(cached.get("at") or "")
+        self.subtitle.setText(
+            "上次读取%s：%d 门课、%d 个作业（点「读取我的课程」刷新）"
+            % (("于 " + when) if when else "", len(self._courses),
+               len(self._assignments)))
+        try:
+            self.count_pill.set_text(
+                "%d 门课 · %d 个作业" % (len(self._courses), len(self._assignments)))
+        except Exception:
+            pass
+        # 顺手把「以前就下过的文件」记进本地索引，这样点「打开」能直接开
+        try:
+            from . import settings_dirs
+
+            elearning.remember_files(
+                self.store, self._download_items(),
+                settings_dirs.downloads_dir(self.store))
+        except Exception:
+            pass
+        return True
+
+    def _download_items(self) -> List[Dict[str, Any]]:
+        """把「课程文件 + 作业附件」摊平成一串可下载项（带课程 / 作业编号）。"""
+        items: List[Dict[str, Any]] = []
+        for course in self._courses:
+            for item in self._assignments:
+                if item.get("course_id") != course.get("id"):
+                    continue
+                for attachment in item.get("attachments") or []:
+                    if not isinstance(attachment, dict):
+                        continue
+                    items.append({"name": attachment.get("name") or "附件",
+                                  "url": str(attachment.get("url") or ""),
+                                  "course": course.get("id"),
+                                  "course_name": course.get("name"),
+                                  "assignment": item.get("id")})
+        return items
+
+    # -------------------------------------------------- 截止时间 → 日程
+    def write_deadlines(self, force: bool = True) -> None:
+        """把 dash 里的作业截止时间写进日程（已有的不重复加）。"""
+        from . import elearn_schedule
+
+        self.calendar_button.setEnabled(False)
+        self.calendar_button.setText("写入中…")
+        self.subtitle.setText("正在读 eLearning 的 dash，把作业截止时间写进日程…")
+        result = {}
+        try:
+            result = elearn_schedule.sync(self.store, force=force)
+        except Exception as exc:  # noqa: BLE001
+            result = {"ok": False, "error": "写入失败：%s" % exc}
+        self.calendar_button.setEnabled(True)
+        self.calendar_button.setText("截止写入日程")
+        message = elearn_schedule.summary(result)
+        self.subtitle.setText(message)
+        self.deadlines_changed.emit(message)
+        return result
+
+    def _on_calendar_switch(self, checked: bool) -> None:
+        from . import elearn_schedule
+
+        elearn_schedule.set_enabled(self.store, bool(checked))
+        self.subtitle.setText("每天自动把作业截止写进日程：%s"
+                              % ("开" if checked else "关"))
 
     # -------------------------------------------------- 视图
     def toggle_view(self) -> None:
@@ -173,18 +277,27 @@ class HomeworkPage(QWidget):
     def read_courses(self) -> None:
         self.subtitle.setText("正在读取课程与作业…")
         client = self._client()
+        detail = ""
+        try:
+            detail = f"（cookie {len(elearning.read_cookies())} 个 · 通道 {type(client).__name__}）"
+        except Exception:
+            detail = ""
         if not client.has_cookies():
             self.subtitle.setText(
-                "还没有 eLearning 登录信息：先点右上角「看网页」登录一次，再点「读取我的课程」")
+                "没读到 eLearning 登录态" + detail +
+                "。如果网页里已经登录，点一下「看网页」再切回来、再点「读取我的课程」"
+                "（登录态是从正在运行的浏览器里现取的）。")
             return
         try:
             courses = elearning.list_courses(client)
         except Exception as exc:  # noqa: BLE001
-            self.subtitle.setText(str(exc))
+            self.subtitle.setText(f"读课程失败{detail}：{exc}")
             return
         if not courses:
             self.subtitle.setText(
-                "没读到课程：请先在网页里完成登录，再点一次「读取我的课程」")
+                "接口没返回课程" + detail +
+                "：多半是登录态只到统一身份认证、还没进到 eLearning。"
+                "请在网页里确认能看到课程列表，再点一次「读取我的课程」。")
             return
         self._courses = courses
         self._assignments = []
@@ -198,9 +311,24 @@ class HomeworkPage(QWidget):
         self.subtitle.setText(
             f"已读取 {len(self._courses)} 门课程、{len(self._assignments)} 个作业")
         self.store.set_setting("elearning_status", self.subtitle.text())
+        self._cache_assignments()
         self.reload()
         self.stack.setCurrentIndex(1)
         self.switch_button.setText("看网页")
+
+    def _cache_assignments(self) -> None:
+        """给仪表板的「最近作业」留一份缓存（那边不联网，直接读这份）。
+
+        走 `dashboard.save_homework_cache`：它把**整份**课程 + 作业（含附件）
+        存下来给作业页自己重启时恢复，同时写一份「最近作业」给仪表板用。
+        """
+        try:
+            from . import dashboard
+
+            dashboard.save_homework_cache(self.store, self._courses,
+                                          self._assignments)
+        except Exception:
+            pass
 
     # -------------------------------------------------- 渲染
     def reload(self) -> None:
@@ -258,9 +386,13 @@ class HomeworkPage(QWidget):
                 row.addWidget(due_label)
             open_button = SoftButton("打开", "subtle", height=26, min_width=56,
                                      point_size=8.2)
+            assignment_item = dict(item)
+            assignment_item.setdefault("course", course.get("id"))
+            assignment_item.setdefault("course_name", course.get("name"))
+            assignment_item.setdefault("assignment", item.get("id"))
             open_button.clicked.connect(
-                lambda _checked=False, name=str(item.get("name", "")):
-                self._open_downloaded(name))
+                lambda _checked=False, target=assignment_item:
+                self._open_downloaded(target))
             row.addWidget(open_button)
             card.body.addLayout(row)
         return card
@@ -281,7 +413,9 @@ class HomeworkPage(QWidget):
                 if not url or url in seen:
                     continue
                 seen.add(url)
-                items.append({"name": file_item["name"], "url": url})
+                items.append({"name": file_item["name"], "url": url,
+                              "course": course.get("id"),
+                              "course_name": course.get("name")})
         # ② 作业描述里的文件链接
         for assignment in self._assignments:
             for attachment in assignment.get("attachments") or []:
@@ -289,7 +423,10 @@ class HomeworkPage(QWidget):
                 if not url or url in seen:
                     continue
                 seen.add(url)
-                items.append({"name": attachment.get("name") or "附件", "url": url})
+                items.append({"name": attachment.get("name") or "附件",
+                              "url": url,
+                              "course": assignment.get("course_id"),
+                              "assignment": assignment.get("id")})
         return items
 
     def download_all(self) -> None:
@@ -328,6 +465,11 @@ class HomeworkPage(QWidget):
                                             on_progress=_progress)
         except Exception as exc:  # noqa: BLE001
             self.subtitle.setText(f"下载失败：{exc}")
+        # 记下「哪个作业/哪门课的文件叫什么」：以后点「打开」就不用靠名字猜
+        try:
+            elearning.remember_files(self.store, items, target)
+        except Exception:
+            pass
         self.download_button.setEnabled(True)
         self._report_result(result, target)
 
@@ -371,30 +513,80 @@ class HomeworkPage(QWidget):
                              f"QLabel {{ color: {theme.TEXT}; }}")
         dialog.exec()
 
-    def _open_downloaded(self, name: str) -> None:
-        """尝试打开下载目录里与该作业同名的文件。"""
-        from . import settings_dirs
-        from .elearning import safe_filename
+    def _open_downloaded(self, item) -> None:
+        """打开这个作业已经下载到本地的文件。
 
+        用户报的：「我有文件为什么打不开？」——以前只拿「作业名」去和文件名做精确
+        比较，`第八周作业` 对应的文件叫 `HW8.2.pdf`，永远对不上，于是只丢一句
+        「下载目录里还没有这个作业的文件」。现在按 索引 → 附件名 → 作业名 →
+        同课程编号 依次找；真的没有就把下载目录打开，让人能自己看见那些文件。
+        """
+        from . import settings_dirs
+
+        if isinstance(item, str):
+            item = {"name": item}
         target_dir = settings_dirs.downloads_dir(self.store)
-        candidate = target_dir / safe_filename(name)
-        if candidate.exists():
-            self.open_document.emit(str(candidate))
-            return
-        # 宽松匹配：文件名包含作业名
         try:
-            for path in target_dir.iterdir():
-                if path.is_file() and name and name in path.name:
-                    self.open_document.emit(str(path))
-                    return
+            found = elearning.local_file_candidates(self.store, target_dir, item)
         except Exception:
-            pass
-        self.subtitle.setText("下载目录里还没有这个作业的文件，先点「一键下载所有作业」")
+            found = []
+        if len(found) == 1:
+            self.open_document.emit(str(found[0]))
+            return
+        if found:
+            self._pick_file(found, str((item or {}).get("name") or ""))
+            return
+        # 找不到：把下载目录打开，别让人对着提示干着急
+        name = str((item or {}).get("name") or "")
+        try:
+            count = len([p for p in target_dir.iterdir() if p.is_file()])
+        except Exception:
+            count = 0
+        self.open_download_dir()
+        if count:
+            self.subtitle.setText(
+                f"「{name}」没有能对上名字的文件；下载目录里现有 {count} 个文件，"
+                f"已经帮你打开：{target_dir}")
+        else:
+            self.subtitle.setText(
+                f"下载目录还是空的（{target_dir}），先点「一键下载所有作业」")
+
+    def _pick_file(self, paths: List[Path], name: str = "") -> None:
+        """对上多个文件时让人自己挑（不替用户猜是哪一个）。"""
+        from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QMenu
+
+        from .widgets import round_menu
+
+        menu = round_menu(QMenu(self))
+        menu.setStyleSheet(
+            f"QMenu {{ background: {theme.CARD}; color: {theme.TEXT};"
+            f" border: 1px solid {theme.BORDER}; border-radius: 10px;"
+            f" padding: 6px; }}"
+            f"QMenu::item {{ padding: 6px 14px; border-radius: 6px; }}"
+            f"QMenu::item:selected {{ background: {theme.CARD_HOVER}; }}")
+        head = menu.addAction(f"「{name}」对应 {len(paths)} 个文件：")
+        head.setEnabled(False)
+        for path in paths[:12]:
+            try:
+                size = path.stat().st_size
+                human = (f"{size / 1024 / 1024:.1f} MB" if size >= 1024 * 1024
+                         else f"{max(1, round(size / 1024))} KB")
+            except OSError:
+                human = ""
+            action = menu.addAction(f"{path.name}    {human}")
+            action.triggered.connect(
+                lambda _checked=False, target=str(path):
+                self.open_document.emit(target))
+        menu.addSeparator()
+        dir_action = menu.addAction("打开下载目录")
+        dir_action.triggered.connect(self.open_download_dir)
+        menu.exec(QCursor.pos())
 
     def open_download_dir(self) -> None:
         target = self.download_target_dir()
         target.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        open_external(str(target), local=True)
 
     def showEvent(self, event):
         super().showEvent(event)

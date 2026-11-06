@@ -1,4 +1,4 @@
-﻿"""Segoe Fluent / MDL2 图标字形常量。"""
+"""Segoe Fluent / MDL2 图标字形常量。"""
 from __future__ import annotations
 
 import sys
@@ -41,6 +41,8 @@ MOON = "\uE708"
 INBOX = "\uE8A0"
 SWAP = "\uE8AB"
 COLUMNS = "\uE8A9"
+LOCK = "\uE72E"
+KEY = "\uE192"
 
 _ICON_FAMILY: str | None = None
 

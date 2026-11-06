@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import docs_reader, icons, theme
+from .utils import open_external
 from .widgets import Card, IconButton, Pill, SoftButton, make_scroll
 
 RECENT_KEY = "docs_recent"
@@ -244,11 +245,11 @@ class DocsPage(QWidget):
     def open_downloads_dir(self) -> None:
         target = self.current_dir()
         target.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        open_external(str(target), local=True)
 
     def open_external(self) -> None:
         if self._current is not None:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current)))
+            open_external(str(self._current), local=True)
 
     def open_path(self, path: Path) -> None:
         path = Path(path)

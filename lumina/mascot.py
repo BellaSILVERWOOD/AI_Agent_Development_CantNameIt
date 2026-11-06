@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 from datetime import date, datetime
 from pathlib import Path
@@ -189,6 +190,12 @@ class Mascot(QWidget):
 
     # -------------------------------------------------- 生命周期
     def set_on(self, enabled: bool) -> None:
+        if enabled and os.environ.get("LUMINA_HIDE_MASCOT"):
+            # 跑测试时不要往用户桌面上弹看板娘（它是个独立窗口，会一直留在桌面上，
+            # 让人以为关掉了设置也没用）
+            self.hide()
+            self._timer.stop()
+            return
         if enabled:
             self._restore_position()
             self.show()

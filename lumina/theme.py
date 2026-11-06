@@ -244,7 +244,7 @@ DEFAULT_APPEARANCE = {
     "accent": ACCENT_DEFAULT,
     "accent2": ACCENT2_DEFAULT,
     "bg": "macos",
-    "alpha": 0.78,
+    "alpha": 0.98,
     "glass": True,
     "blur": 24.0,
     "mode": "auto",
@@ -424,7 +424,13 @@ def _palette_values() -> Dict[str, str]:
 
 def _apply_palette(rebind: bool = True) -> Dict[str, str]:
     """把当前主题的色值写入本模块全局量，并同步到已导入这些名字的模块。"""
+    global _PREV_TOKENS
+    previous = _snapshot_tokens()
     values = _palette_values()
+    if any(previous.get(key, "") != values.get(key, "")
+           for key in previous):
+        # 记下「换之前」的颜色：控件里写死的样式表要照着它替换
+        _PREV_TOKENS = previous
     for key, value in values.items():
         globals()[key] = value
     if rebind:
@@ -496,7 +502,7 @@ def load_from_store(store) -> None:
     accent = store.get_setting("theme_accent", ACCENT_DEFAULT) or ACCENT_DEFAULT
     accent2 = store.get_setting("theme_accent2", ACCENT2_DEFAULT) or ACCENT2_DEFAULT
     bg = store.get_setting("theme_bg", "macos") or "macos"
-    alpha_text = store.get_setting("theme_alpha", "0.78") or "0.78"
+    alpha_text = store.get_setting("theme_alpha", "0.98") or "0.98"
     try:
         alpha = float(alpha_text)
     except ValueError:
@@ -626,11 +632,13 @@ def event_ink(key: str) -> QColor:
 
 
 def mail_tone(status: str) -> str:
-    """发件箱状态色（草稿灰 / 已发绿 / 失败红）。"""
+    """发件箱状态色（草稿灰 / 已发绿 / 失败红 / 退信橙）。"""
     if status == "sent":
         return SUCCESS
     if status == "failed":
         return DANGER
+    if status == "bounced":
+        return WARNING
     return MUTED
 
 
@@ -814,8 +822,28 @@ def web_dark_mode() -> bool:
     return is_dark()
 
 
+_REVISION = 0
+
+
+def revision() -> int:
+    """主题版本号，每换一次主题 +1。
+
+    自绘控件（日历网格、卡片、图标按钮）会在构造时把颜色抄一份留着，
+    换主题后必须让它们知道「缓存过期了」。paintEvent 里对一下版本号最省事，
+    也不需要挨个控件去连信号。
+    """
+    return _REVISION
+
+
+def _bump_revision() -> int:
+    global _REVISION
+    _REVISION += 1
+    return _REVISION
+
+
 def apply_theme(app: QApplication) -> None:
     _apply_palette()
+    _bump_revision()
     app.setStyle("Fusion")
     app.setFont(app_font())
 
@@ -837,7 +865,124 @@ def apply_theme(app: QApplication) -> None:
     palette.setColor(QPalette.ColorRole.Dark, QColor(BORDER))
     palette.setColor(QPalette.ColorRole.Light, QColor(CARD_HOVER))
     app.setPalette(palette)
+    # 先把样式表清空再设一遍：Qt 只在字符串变化时才重新 polish，
+    # 清空一下能逼所有控件按新主题重新解析（否则有些控件还留着旧配色）
+    app.setStyleSheet("")
     app.setStyleSheet(current_stylesheet())
+    _rewrite_inline_styles(app)
+    _refresh_app_widgets(app)
+    # 主题变了，正显示着的提示气泡按旧配色画的，直接收掉
+    try:
+        from . import tooltip
+
+        tooltip.hide_tip()
+    except Exception:
+        pass
+
+
+_TOKEN_NAMES = tuple(sorted(PALETTES["light"].keys())) + ("ACCENT", "ACCENT2",
+                                                          "ACCENT_DEEP")
+_PREV_TOKENS: Dict[str, str] = {}
+
+
+def _snapshot_tokens() -> Dict[str, str]:
+    """当前这套主题令牌的色值（换主题前拍一张，用来改掉控件里写死的旧颜色）。"""
+    return {name: str(globals().get(name, "") or "") for name in _TOKEN_NAMES}
+
+
+def _rewrite_inline_styles(app: QApplication) -> None:
+    """把控件自己 setStyleSheet 里写死的旧主题色换成新主题色。
+
+    很多地方是 `label.setStyleSheet(f"color: {TEXT}")` 这种写法 —— 样式表是
+    当时算好的字符串，换主题时不会跟着变（浅色模式下备忘编辑器整块黑、
+    左下角那个日期一直看不见，都是这个原因）。这里按「旧色值 → 新色值」做一次
+    替换，通用且不用挨个改控件。
+
+    **换完必须把 `_PREV_TOKENS` 清空**：一次切主题 souvent 会连着调好几次
+    `apply_theme`（set_mode → preview → 刷新），第二遍再用同一张映射表就会**链式替换**
+    —— 浅色 TEXT #1D1D1F 先变成深色 TEXT #F5F5F7，第二遍又把 #F5F5F7 当成
+    「浅色 WINDOW_MID」换成 #212124，结果深色下的文字还是深色（用户报的
+    「切深色之后这些文字还是深色」就是这个）。清空后第二遍就是空操作。
+    """
+    global _PREV_TOKENS
+    after = _snapshot_tokens()
+    before = _PREV_TOKENS or {}
+    mapping = {}
+    # 文字类令牌最后写：同一个色值被多个令牌共用时（浅色 TEXT 和 TOOLTIP_TEXT
+    # 都是 #1D1D1F、CARD 和 INPUT_BG 都是 #FFFFFF），文字要按文字换，
+    # 底色之间仍按原来的顺序（INPUT_BG 在 CARD 之后，浅色 #FFFFFF 换成 #1B1B1D，
+    # 备忘编辑器就靠这个）。
+    text_names = ("TEXT", "TEXT_SOFT", "MUTED", "FAINT")
+    names = [name for name in before if name not in text_names] + \
+            [name for name in text_names if name in before]
+    for name in names:
+        old = str(before.get(name, "") or "")
+        new = str(after.get(name, "") or "")
+        if len(old) == 7 and old.startswith("#") and new and old.lower() != new.lower():
+            mapping[old.lower()] = new
+    _PREV_TOKENS = {}
+    if not mapping:
+        return
+    # 一次扫描替换：不能一条条 replace —— 新的浅色值可能正好等于另一个令牌的
+    # 旧深色值（比如深色 TEXT 和浅色 CARD_ALT 都是 #F5F5F7），顺序替换会串色。
+    pattern = re.compile("|".join(re.escape(old) for old in mapping),
+                         re.IGNORECASE)
+    try:
+        widgets = list(app.allWidgets())
+    except Exception:
+        return
+    for widget in widgets:
+        try:
+            sheet = widget.styleSheet()
+        except Exception:
+            continue
+        if not sheet or "#" not in sheet:
+            continue
+        if not pattern.search(sheet):
+            continue
+        patched = pattern.sub(lambda match: mapping[match.group(0).lower()], sheet)
+        if patched != sheet:
+            try:
+                widget.setStyleSheet(patched)
+            except Exception:
+                continue
+
+
+def _refresh_app_widgets(app: QApplication) -> None:
+    """重刷所有控件的绘制，并让内嵌网页按新主题重新设定暗色。
+
+    为什么需要这个：日历网格 / 日程列表 / 左下角日期这些都是**自绘**控件
+    （`paintEvent` 里读颜色）；内嵌网页（eLearning / eHall）的暗色是
+    `ForceDarkMode` 设置，只在创建时设过一次 —— 浅色模式下它们会一直是黑的。
+    """
+    widgets = []
+    try:
+        widgets = list(app.allWidgets())
+    except Exception:
+        widgets = []
+    for widget in widgets:
+        # 自绘控件如果实现了 on_theme_changed，就先让它把缓存的主题色换掉再重绘
+        hook = getattr(widget, "on_theme_changed", None)
+        if callable(hook):
+            try:
+                hook()
+            except Exception:
+                pass
+        try:
+            widget.update()
+        except Exception:
+            continue
+    try:
+        from . import web_panel
+
+        for widget in widgets:
+            if isinstance(widget, web_panel.EmbeddedWebPanel):
+                try:
+                    widget.refresh_browser_theme()
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
 
 def _tokens() -> Dict[str, str]:

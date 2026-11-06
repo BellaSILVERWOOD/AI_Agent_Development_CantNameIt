@@ -295,6 +295,9 @@ def document_to_latex(document: QTextDocument) -> str:
         else:
             paragraph = block_to_latex(block)
             lines.append(paragraph if paragraph else "")
+            # 每个段落后面空一行：LaTeX 里空行才是「换段」，
+            # 不然用户在编辑区按的回车到右边全被吞掉（只有空格）
+            lines.append("")
 
         iterator += 1
 

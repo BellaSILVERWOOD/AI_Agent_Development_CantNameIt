@@ -1,4 +1,4 @@
-"""把本地文件读成纯文本、把图片读成「可直接发给模型的数据」，塞进对话上下文。
+﻿"""把本地文件读成纯文本、把图片读成「可直接发给模型的数据」，塞进对话上下文。
 
 支持：
 * 纯文本类（`TEXT_SUFFIXES`）：按 UTF-8 → GB18030 依次尝试解码；
@@ -22,9 +22,9 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-MAX_CHARS = 24000
-MAX_FILES = 20
-MAX_TOTAL_CHARS = 60000
+MAX_CHARS = 120000            # 单个附件最多读这么多字（原来 24000，用户要求放宽）
+MAX_FILES = 60                # 一次最多带多少个附件（原来 20）
+MAX_TOTAL_CHARS = 400000      # 附件合计上限（原来 60000，用户要求放宽到 40 万字）
 MAX_FOLDER_FILES = 200        # 拖一个文件夹进来时最多扫这么多个文件
 MAX_IMAGES = 6                # 一次最多带几张图
 MAX_IMAGE_BYTES = 4 * 1024 * 1024     # 单张图超过 4MB 就拒掉
@@ -47,7 +47,7 @@ VISION_HINTS = ("vl", "vision", "gpt-4o", "gpt-4.1", "gpt-5", "o3", "o4",
                 "step-1v", "ernie-4.5-vl", "doubao-vision")
 #: PDF 最多读多少页 / 每页最多留多少字（扫描件一般是空的，会提示）
 PDF_MAX_PAGES = 60
-PDF_MAX_CHARS = 24000
+PDF_MAX_CHARS = 120000            # 单个附件最多读这么多字（原来 24000，用户要求放宽）
 
 
 def is_image(path: Path) -> bool:

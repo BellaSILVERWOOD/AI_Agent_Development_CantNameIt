@@ -30,7 +30,9 @@ from .widgets import (Card, ClickableLabel, HScrollRow, round_menu, Select,
                       SoftButton)
 
 MAX_CONTEXT_TURNS = 8
-MAX_TOOL_ROUNDS = 6        # 一次提问里最多来回几轮工具调用（防止死循环）
+MAX_TOOL_ROUNDS = 6        # 旧上限（保留名字兼容旧引用；实际已不再用它限制轮数）
+#: 只做「病态死循环」的极端保护，正常对话碰不到（用户要求：每轮对话的工具调用不设上限）
+SAFETY_MAX_TOOL_ROUNDS = 1000
 #: 附件路径存哪儿：附件一直带着，重开应用也要能读回来
 ATTACH_KEY = "ai_attach_paths"
 
@@ -1177,10 +1179,13 @@ class ApiChatPanel(QWidget):
             self._finish_turn()
             self.status.setText("已停止")
             return
-        if self._turn_round > MAX_TOOL_ROUNDS:
+        # 用户要求：**不再限制工具调用轮数**（原来超过 MAX_TOOL_ROUNDS=6 就停）。
+        # 循环自然结束的条件是「模型这一轮不再返回 tool_calls」；用户随时可以点「停止」中断。
+        # 这里只保留一个纯保护性的极端值（防止模型病态地无限自调用），正常对话永远不会触及。
+        if self._turn_round > SAFETY_MAX_TOOL_ROUNDS:
             self._history.append({"role": "assistant",
-                                  "content": partial or "（工具调用次数过多，先停在这里）"})
-            self.status.setText(f"工具调用超过 {MAX_TOOL_ROUNDS} 轮，先停了")
+                                  "content": partial or "（工具调用轮数异常，先停在这里）"})
+            self.status.setText(f"工具调用超过 {SAFETY_MAX_TOOL_ROUNDS} 轮（异常保护），先停了")
             self._finish_turn()
             return
 

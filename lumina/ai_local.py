@@ -1,4 +1,4 @@
-"""本地资源访问（沙盒）：让 AI 能读写**你允许的目录**里的文件。
+﻿"""本地资源访问（沙盒）：让 AI 能读写**你允许的目录**里的文件。
 
 三条硬规矩（都在这儿实现，工具层再挡一道）：
 
@@ -24,7 +24,7 @@ MODE_KEY = "local_access"            # off / read / write
 ROOTS_KEY = "local_roots"            # 多行文本，一行一个目录（这些目录里的操作要确认）
 DIRECT_KEY = "local_direct_roots"    # JSON 列表：本次工作「直接访问」的目录（不确认）
 MAX_BYTES_KEY = "local_max_bytes"    # 单文件读取上限
-DEFAULT_MODE = "off"
+DEFAULT_MODE = "read"        # 用户要求：AI 默认能读本程序的目录（写仍然要单独开 "write"）
 DEFAULT_MAX_BYTES = 256 * 1024
 MAX_READ_BYTES = 2 * 1024 * 1024     # 就算设置写大了也不超过这个
 WORKSPACE_NAME = "agent_workspace"
@@ -134,7 +134,14 @@ def remove_root(store, path) -> List[str]:
 
 def roots(store, create: bool = True) -> List[Path]:
     """实际生效的目录（白名单）。默认一定含内置工作区。"""
+    # 内置工作区 + 本程序的数据目录（eLearning 下载的作业、导出物都在这里）
     found: List[Path] = [workspace(store, create=create)]
+    try:
+        data_dir = _data_dir()
+        if data_dir.exists():
+            found.append(data_dir)
+    except Exception:
+        pass
     for item in raw_roots(store):
         try:
             path = Path(item).expanduser()

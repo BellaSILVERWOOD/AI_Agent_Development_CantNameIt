@@ -77,6 +77,16 @@ class HomeworkPage(QWidget):
         self.open_dir_button.clicked.connect(self.open_download_dir)
         header.addWidget(self.open_dir_button)
 
+        # 次级按钮：只读本地索引，把升级前平铺的文件挪进课程文件夹
+        self.organize_button = SoftButton("整理旧下载文件", "ghost", height=34,
+                                          min_width=118, glyph=icons.SWAP,
+                                          point_size=8.8)
+        self.organize_button.setToolTip(
+            "把以前平铺在下载目录里的文件，按本地索引记录挪进各自的课程文件夹；"
+            "认不出属于哪门课的文件会留在原地，不会动")
+        self.organize_button.clicked.connect(self.organize_downloads)
+        header.addWidget(self.organize_button)
+
         self.switch_button = SoftButton("看列表", "subtle", height=34, min_width=86,
                                         point_size=8.8)
         self.switch_button.clicked.connect(self.toggle_view)
@@ -518,6 +528,39 @@ class HomeworkPage(QWidget):
         dialog.setStyleSheet(f"QDialog {{ background: {theme.CARD}; }}"
                              f"QLabel {{ color: {theme.TEXT}; }}")
         dialog.exec()
+
+    # -------------------------------------------------- 整理旧下载
+    def organize_downloads(self) -> None:
+        """把升级前平铺在下载目录里的文件，挪进各自的课程文件夹。
+
+        故意不传 client：整理是「顺手做的小事」，没登录 / 没网也应该能用，
+        只靠本地索引认课程；认不出来的文件留在根目录并如实说出来。
+        """
+        target = self.download_target_dir()
+        self.organize_button.setEnabled(False)
+        self.subtitle.setText("正在整理旧下载文件…")
+        try:
+            from PySide6.QtWidgets import QApplication
+
+            QApplication.processEvents()
+            result = elearning.migrate_flat_downloads(self.store, target)
+        except Exception as exc:  # noqa: BLE001
+            self.organize_button.setEnabled(True)
+            self.subtitle.setText(f"整理旧下载文件失败：{exc}")
+            return
+        self.organize_button.setEnabled(True)
+        moved = result.get("moved") or []
+        deduped = result.get("deduped") or []
+        unresolved = result.get("unresolved") or []
+        failed = result.get("failed") or []
+        message = (f"整理完成：迁移 {len(moved)} 个、去重 {len(deduped)} 个、"
+                   f"未识别 {len(unresolved)} 个")
+        if failed:
+            message += f"、失败 {len(failed)} 个"
+        message += f" → {target}（每门课一个文件夹）"
+        if unresolved:
+            message += "；未识别的文件留在下载目录根下，没有动"
+        self.subtitle.setText(message)
 
     def _open_downloaded(self, item) -> None:
         """打开这个作业已经下载到本地的文件。

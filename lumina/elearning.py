@@ -1066,3 +1066,156 @@ def local_file_for(store, root: Path, item: Dict[str, Any]) -> Optional[Path]:
     """只有一个候选文件时才返回它（多个候选让人自己挑，别猜）。"""
     found = local_file_candidates(store, root, item)
     return found[0] if len(found) == 1 else None
+
+
+# ---------------------------------------------------------------- 旧文件迁移
+def _flat_course_map(entries: List[Dict[str, str]]) -> Dict[str, str]:
+    """索引里「还平铺在根目录」的条目 → 文件名到课程目录名。
+
+    只认 `name` 不带分隔符的：带了斜杠就说明已经在课程文件夹里，不用再挪。
+    课程名优先取 `course_name`，因为 `course` 有时存的是课程 id，拿 id 当文件夹名没意义。
+    """
+    mapping: Dict[str, str] = {}
+    for entry in entries:
+        name = str(entry.get("name") or "").strip()
+        if not name or "/" in name or "\\" in name:
+            continue
+        course = str(entry.get("course_name") or entry.get("course") or "").strip()
+        if not course:
+            continue          # 课程是空的：跟解析不到一样，文件留在原地
+        mapping.setdefault(name, course)
+    return mapping
+
+
+def _network_course_map(client) -> Dict[str, str]:
+    """联网建一张「安全文件名 → 课程名」的表（只在索引对不上时才用）。
+
+    复用 `list_courses` / `list_files`，接口错误一律吞掉：联网只是加分项，
+    拉不到就少认几个课程，不能让整次迁移失败。
+    """
+    mapping: Dict[str, str] = {}
+    if client is None or not hasattr(client, "get_json"):
+        return mapping
+    try:
+        courses = list_courses(client)
+    except Exception:  # noqa: BLE001
+        return mapping
+    for course in courses:
+        title = str(course.get("name") or course.get("code") or "").strip()
+        if not title:
+            continue
+        try:
+            files = list_files(client, course.get("id"))
+        except Exception:  # noqa: BLE001
+            continue
+        for item in files:
+            key = safe_filename(str(item.get("name") or ""))
+            if key:
+                mapping.setdefault(key, title)
+    return mapping
+
+
+def _free_target(target: Path) -> Path:
+    """目标被占用时按「主名 (2).扩展名」往后找空位（再冲突就 (3)、(4)…）。"""
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    for index in range(2, 1000):
+        candidate = target.with_name(f"{stem} ({index}){suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"同名文件太多，挪不过去：{target.name}")
+
+
+def _move_no_overwrite(source: Path, target: Path) -> None:
+    """把 source 移到 target；目标已存在就抛异常，绝不覆盖已下载的那份。"""
+    if target.exists():
+        raise FileExistsError(f"目标已存在：{target.parent.name}/{target.name}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import shutil
+
+        shutil.move(str(source), str(target))
+    except Exception:
+        # 跨盘复制到一半会留个半截目标；只要源还在，就清掉残片再往上抛，
+        # 这样「要么源还在原位，要么目标完整」二者必居其一。
+        if source.exists() and target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def migrate_flat_downloads(store, root: Path, client=None,
+                           dry_run: bool = False) -> Dict[str, Any]:
+    """把升级前平铺在 `<下载目录>/` 下的文件挪进各自课程的子文件夹。
+
+    只处理**直接位于 root 下**的文件，不递归进已有子文件夹（那是新规则的地盘）。
+    认课程的顺序：本地索引 → 联网按文件名对（要 client）→ 认不出就留原地。
+    `dry_run=True` 只统计、不动任何文件；任何一步出错都把文件留在原位并记进 failed。
+    """
+    base = Path(root)
+    result: Dict[str, Any] = {"moved": [], "deduped": [], "unresolved": [],
+                              "failed": [], "root": str(base)}
+    if not base.is_dir():
+        return result
+    entries = load_file_index(store)
+    by_name = _flat_course_map(entries)
+    remote: Optional[Dict[str, str]] = None
+    updates: Dict[str, str] = {}
+    try:
+        listing = sorted(path for path in base.iterdir() if path.is_file())
+    except OSError as exc:
+        result["failed"].append((str(base), f"读不了下载目录：{exc}"))
+        return result
+    for source in listing:
+        name = source.name
+        if name.endswith(".part") or name.endswith(".crdownload"):
+            continue          # 下载中断留下的残片不算「旧文件」
+        try:
+            course = by_name.get(name) or by_name.get(safe_filename(name)) or ""
+            if not course:
+                # 索引对不上才联网，避免无谓地去拉一遍课程列表
+                if remote is None:
+                    remote = _network_course_map(client)
+                course = remote.get(safe_filename(name)) or ""
+            course = str(course or "").strip()
+            if not course:
+                result["unresolved"].append(name)
+                continue
+            folder = safe_filename(course)
+            target = base / folder / name
+            deduped = False
+            if target.is_file():
+                try:
+                    same_size = target.stat().st_size == source.stat().st_size
+                except OSError:
+                    same_size = False
+                if same_size:
+                    deduped = True
+                else:
+                    target = _free_target(target)
+            if dry_run:
+                bucket = result["deduped"] if deduped else result["moved"]
+                bucket.append((target.name, course))
+                continue
+            if deduped:
+                source.unlink()   # 内容一样：删根目录这份，留子文件夹那份
+            else:
+                _move_no_overwrite(source, target)
+            updates[name] = f"{folder}/{target.name}"
+            bucket = result["deduped"] if deduped else result["moved"]
+            bucket.append((target.name, course))
+        except Exception as exc:  # noqa: BLE001
+            result["failed"].append((name, str(exc)))
+    if updates and not dry_run:
+        touched = False
+        for entry in entries:
+            old = str(entry.get("name") or "").strip()
+            if old in updates and "/" not in old and "\\" not in old:
+                entry["name"] = updates[old]
+                touched = True
+        if touched:
+            save_file_index(store, entries)
+    return result

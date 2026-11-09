@@ -1184,6 +1184,27 @@ QTextBrowser {
     border: none;
 }
 
+/* 文档页的目录树：透明底，选中/悬停沿用主题色 */
+QTreeWidget#DocsTree {
+    background: transparent;
+    border: none;
+    color: @TEXT_SOFT@;
+    font-size: @F_SMALL@;
+    show-decoration-selected: 1;
+}
+QTreeWidget#DocsTree::item {
+    padding: 4px 2px;
+    border-radius: 6px;
+    color: @TEXT_SOFT@;
+}
+QTreeWidget#DocsTree::item:hover {
+    background: @CARD_HOVER@;
+}
+QTreeWidget#DocsTree::item:selected {
+    background: @ACCENT_SOFT@;
+    color: @TEXT@;
+}
+
 QSlider::groove:horizontal {
     height: 4px;
     background: @SLIDER_GROOVE@;

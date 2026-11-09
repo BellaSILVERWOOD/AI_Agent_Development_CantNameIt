@@ -780,6 +780,8 @@ def elearning_download(store, args: Dict[str, Any]) -> Dict[str, Any]:
     client = data["client"]
     courses = data["courses"]
     assignments = data["assignments"]
+    course_names = {str(course.get("id")): str(course.get("name") or "")
+                    for course in courses}
 
     items: List[Dict[str, Any]] = []
     seen = set()
@@ -790,7 +792,9 @@ def elearning_download(store, args: Dict[str, Any]) -> Dict[str, Any]:
                 if not url or url in seen:
                     continue
                 seen.add(url)
-                items.append({"name": file_item["name"], "url": url})
+                items.append({"name": file_item["name"], "url": url,
+                              "course": course.get("id"),
+                              "course_name": course.get("name")})
         except Exception:
             continue
     for assignment in assignments:
@@ -799,22 +803,29 @@ def elearning_download(store, args: Dict[str, Any]) -> Dict[str, Any]:
             if not url or url in seen:
                 continue
             seen.add(url)
-            items.append({"name": attachment.get("name") or "附件", "url": url})
+            course_id = str(assignment.get("course_id"))
+            items.append({"name": attachment.get("name") or "附件", "url": url,
+                          "course": assignment.get("course_id"),
+                          "course_name": course_names.get(course_id, ""),
+                          "assignment": assignment.get("id")})
         if len(items) >= limit:
             break
     items = items[:limit]
     if not items:
         return {"ok": True, "summary": "没有找到可下载的文件（课程文件是空的或登录过期了）"}
     target = settings_dirs.downloads_dir(store)
-    result = elearning.download_all(client, items, target)
+    # 按课程分文件夹下载：下载目录/<课程名>/<文件名>
+    result = elearning.download_by_course(client, items, target)
     saved = result.get("saved") or []
     skipped = result.get("skipped") or []
     failed = result.get("failed") or []
     return {"ok": True,
             "summary": (f"下载完成：新增 {len(saved)} 个、重名跳过 {len(skipped)} 个、"
-                        f"失败 {len(failed)} 个 → {target}"),
+                        f"失败 {len(failed)} 个 → {target}（按课程分了 "
+                        f"{len(result.get('dirs') or [])} 个文件夹）"),
             "saved": len(saved), "skipped": len(skipped), "failed": len(failed),
-            "target": str(target), "files": [str(n) for n in saved[:20]]}
+            "target": str(target), "dirs": result.get("dirs") or [],
+            "files": [str(n) for n in saved[:20]]}
 
 
 # ------------------------------------------------------------------ 课表

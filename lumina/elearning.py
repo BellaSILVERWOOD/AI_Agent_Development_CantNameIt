@@ -708,18 +708,29 @@ def parse_file_links(html: str) -> List[Dict[str, str]]:
 
 
 def safe_filename(name: str) -> str:
-    cleaned = "".join("_" if char in '\\/:*?"<>|' else char for char in (name or ""))
+    # 非法字符统一换成 `-`，与 Rust 版 course_dir_name 的规则保持一致，
+    # 这样同一门课在两个版本里下载下来的目录名完全相同。
+    cleaned = "".join("-" if char in '\\/:*?"<>|' else char for char in (name or ""))
     cleaned = cleaned.strip().strip(".")
     return cleaned or "未命名"
 
 
 # ------------------------------------------------------------------ 批量下载
 def download_all(client: ElearningClient, items: List[Dict[str, Any]],
-                 target_dir: Path, on_progress=None) -> Dict[str, Any]:
-    """批量下载；**重名的跳过**（不覆盖、不重复下载）。"""
+                 target_dir: Path, course: Optional[str] = None,
+                 on_progress=None) -> Dict[str, Any]:
+    """批量下载；**重名的跳过**（不覆盖、不重复下载）。
+
+    `course` 传课程名时存到 ``target_dir/<课程名>/<文件名>``：下载目录按
+    来源课程分二级文件夹，一学期的课件不再摊成一整层。不传时行为和以前
+    一样（平铺），老调用点不用改。
+    """
     target_dir = Path(target_dir)
+    if course:
+        target_dir = target_dir / safe_filename(str(course))
     target_dir.mkdir(parents=True, exist_ok=True)
-    result: Dict[str, Any] = {"saved": [], "skipped": [], "failed": []}
+    result: Dict[str, Any] = {"saved": [], "skipped": [], "failed": [],
+                              "dir": str(target_dir)}
     total = len(items)
     used_names = set()
     for index, item in enumerate(items):
@@ -749,8 +760,46 @@ def download_all(client: ElearningClient, items: List[Dict[str, Any]],
     return result
 
 
+def download_by_course(client: ElearningClient, items: List[Dict[str, Any]],
+                       target_dir: Path, on_progress=None) -> Dict[str, Any]:
+    """一次下载多门课的文件：按课程分组，各自落到自己的课程文件夹。
+
+    为什么需要：「一键下载」收的是所有课的清单，直接平铺又回到全堆一层；
+    这里按 item 里的 `course_name`（没有就用课程 id）分组后逐组调用
+    `download_all`。返回值结构和 `download_all` 一样，另加 `dirs` 列出
+    本次用到的子目录。
+    """
+    root = Path(target_dir)
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        course = str(item.get("course_name") or item.get("course")
+                     or item.get("course_id") or "").strip()
+        groups.setdefault(course, []).append(item)
+
+    merged: Dict[str, Any] = {"saved": [], "skipped": [], "failed": [],
+                              "dir": str(root), "dirs": []}
+    total = sum(len(group) for group in groups.values())
+    done = 0
+    for course, group in groups.items():
+        def _progress(index: int, _count: int, name: str, base: int = done) -> None:
+            if on_progress is not None:
+                on_progress(base + index, total, name)
+
+        result = download_all(client, group, root, course=course or None,
+                              on_progress=_progress if on_progress else None)
+        done += len(group)
+        for key in ("saved", "skipped", "failed"):
+            merged[key].extend(result.get(key) or [])
+        used = result.get("dir") or ""
+        if used and used not in merged["dirs"]:
+            merged["dirs"].append(used)
+    return merged
+
+
 # ---------------------------------------------------------------- 本地索引
-#: 「这个作业/这门课的文件，本地叫哪些名字」——下载完记一笔，打开时就不用猜
+#: 「这个作业/这门课的文件，本地叫什么」——下载完记一笔，打开时就不用猜
 FILE_INDEX_KEY = "elearning_file_index"
 #: 索引最多留多少条（190 多个文件也就一两百条，留余量）
 FILE_INDEX_MAX = 2000
@@ -821,9 +870,23 @@ def save_file_index(store, entries: List[Dict[str, str]]) -> None:
         pass
 
 
+def _download_rel(root: Path, name: str, course: str = "") -> str:
+    """文件下载后相对下载目录的路径（「课程/文件名」；没有课程时就是文件名）。
+
+    索引里现在记这个相对路径，否则按课程分了文件夹之后只记文件名会对不上。
+    """
+    base = Path(root)
+    folder = safe_filename(str(course)) if course else ""
+    for prefix in ([folder] if folder else []) + [""]:
+        path = base / prefix / name if prefix else base / name
+        if path.is_file():
+            return f"{prefix}/{name}" if prefix else name
+    return ""
+
+
 def remember_files(store, items: List[Dict[str, Any]],
                    target_dir: Path) -> int:
-    """把「已经下载到本地的文件」记进索引：课程 / 作业 → 文件名。
+    """把「已经下载到本地的文件」记进索引：课程 / 作业 → 相对路径。
 
     `items` 里的每一项可以带 ``course`` / ``course_name`` / ``assignment``
     （page_homework 收集清单时会带上）；文件已经存在（跳过重名）的也照记，
@@ -838,12 +901,15 @@ def remember_files(store, items: List[Dict[str, Any]],
         name = safe_filename(str(item.get("name") or ""))
         if not name:
             continue
-        key = (str(item.get("course") or ""), str(item.get("assignment") or ""), name)
+        rel = _download_rel(root, name,
+                            str(item.get("course_name") or item.get("course")
+                                or item.get("course_id") or ""))
+        if not rel:
+            continue
+        key = (str(item.get("course") or ""), str(item.get("assignment") or ""), rel)
         if key in seen:
             continue
-        if not (root / name).is_file():
-            continue
-        entries.append({"course": key[0], "assignment": key[1], "name": name,
+        entries.append({"course": key[0], "assignment": key[1], "name": rel,
                         "course_name": str(item.get("course_name") or "")})
         seen.add(key)
         added += 1
@@ -915,6 +981,14 @@ def find_local_file(root: Path, names: List[str],
     return None
 
 
+def _indexed_path(root: Path, name: str) -> Optional[Path]:
+    """索引里的名字 → 实际文件；现在可能是「课程/文件.pdf」这种相对路径。"""
+    direct = Path(root) / str(name or "")
+    if direct.is_file():
+        return direct
+    return find_local_file(Path(root), [str(name or "")])
+
+
 def files_for(store, root: Path, course: str = "",
               assignment: str = "") -> List[Path]:
     """索引里这个作业（或这门课）对应的本地文件，按存在的挑出来。"""
@@ -930,7 +1004,7 @@ def files_for(store, root: Path, course: str = "",
             names.append(str(entry.get("name") or ""))
     found: List[Path] = []
     for name in names:
-        hit = find_local_file(base, [name], recursive=True)
+        hit = _indexed_path(base, name)
         if hit is not None and hit not in found:
             found.append(hit)
     return found
@@ -971,11 +1045,13 @@ def local_file_candidates(store, root: Path, item: Dict[str, Any]) -> List[Path]
                 continue
             file_name = str(entry.get("name") or "")
             if tokens & set(number_tokens(file_name)):
-                add(base / safe_filename(file_name))
+                add(_indexed_path(base, file_name))
     # ④ 索引里还没有（升级前就下过的一批文件）：直接扫下载目录，按编号对一对
     if not found:
         try:
-            listing = sorted(path for path in base.iterdir() if path.is_file())
+            listing = sorted(path for path in base.rglob("*")
+                             if path.is_file()
+                             and len(path.relative_to(base).parts) <= 3)
         except OSError:
             listing = []
         for path in listing:

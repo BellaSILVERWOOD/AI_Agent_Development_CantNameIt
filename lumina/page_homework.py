@@ -406,6 +406,9 @@ class HomeworkPage(QWidget):
     def _collect_items(self, client) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         seen = set()
+        # 课程 id → 课程名：作业附件也要能按课程分文件夹
+        course_names = {str(course.get("id")): str(course.get("name") or "")
+                        for course in self._courses}
         # ① 课程文件
         for course in self._courses:
             for file_item in elearning.list_files(client, course["id"]):
@@ -423,9 +426,11 @@ class HomeworkPage(QWidget):
                 if not url or url in seen:
                     continue
                 seen.add(url)
+                course_id = str(assignment.get("course_id"))
                 items.append({"name": attachment.get("name") or "附件",
                               "url": url,
                               "course": assignment.get("course_id"),
+                              "course_name": course_names.get(course_id, ""),
                               "assignment": assignment.get("id")})
         return items
 
@@ -450,7 +455,7 @@ class HomeworkPage(QWidget):
             self.download_button.setEnabled(True)
             return
         target = self.download_target_dir()
-        self.subtitle.setText(f"正在下载 {len(items)} 个文件到 {target} …")
+        self.subtitle.setText(f"正在下载 {len(items)} 个文件到 {target}（按课程分文件夹）…")
 
         def _progress(done: int, total: int, name: str) -> None:
             if done % 5 == 0 or done == total:
@@ -461,8 +466,9 @@ class HomeworkPage(QWidget):
 
         result: Dict[str, Any] = {"saved": [], "skipped": [], "failed": []}
         try:
-            result = elearning.download_all(client, items, target,
-                                            on_progress=_progress)
+            # 按课程分组下载：每门课的文件落到「下载目录/课程名/」下面
+            result = elearning.download_by_course(client, items, target,
+                                                  on_progress=_progress)
         except Exception as exc:  # noqa: BLE001
             self.subtitle.setText(f"下载失败：{exc}")
         # 记下「哪个作业/哪门课的文件叫什么」：以后点「打开」就不用靠名字猜
@@ -479,7 +485,7 @@ class HomeworkPage(QWidget):
         failed = result.get("failed") or []
         self.subtitle.setText(
             f"下载完成：新增 {len(saved)} 个，跳过重名 {len(skipped)} 个，"
-            f"失败 {len(failed)} 个 → {target}")
+            f"失败 {len(failed)} 个 → {target}（每门课一个文件夹）")
         if not (skipped or failed):
             return
         dialog = QDialog(self)
@@ -539,7 +545,8 @@ class HomeworkPage(QWidget):
         # 找不到：把下载目录打开，别让人对着提示干着急
         name = str((item or {}).get("name") or "")
         try:
-            count = len([p for p in target_dir.iterdir() if p.is_file()])
+            # 文件现在按课程分了子文件夹，得递归数
+            count = len([p for p in target_dir.rglob("*") if p.is_file()])
         except Exception:
             count = 0
         self.open_download_dir()

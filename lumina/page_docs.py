@@ -1,6 +1,6 @@
 """文档页：在应用内打开 PDF / DOCX / PPTX / XLSX / 文本。
 
-左侧是文件列表（下载目录 + 最近打开），右侧是查看器：
+左侧是目录树（「最近打开」+ 下载目录，文件夹可展开 / 收起），右侧是查看器：
 PDF 用 QtPdf，其它格式解析成 HTML 用 QTextBrowser 显示。
 """
 from __future__ import annotations
@@ -8,18 +8,38 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QPointF, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import QPointF, QSize, Qt, QTimer
+from PySide6.QtGui import (
+    QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut,
+)
 from PySide6.QtWidgets import (
-    QFileDialog, QHBoxLayout, QLabel, QStackedWidget, QTextBrowser, QVBoxLayout,
-    QWidget,
+    QFileDialog, QHBoxLayout, QLabel, QStackedWidget, QTextBrowser, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import docs_reader, icons, theme
 from .utils import open_external
-from .widgets import Card, IconButton, Pill, SoftButton, make_scroll
+from .widgets import Card, IconButton, Pill, SoftButton, icon_font
 
 RECENT_KEY = "docs_recent"
+#: 树节点的数据：路径 / 节点类型（group 分组、folder 文件夹、file 文件、hint 提示）
+PATH_ROLE = int(Qt.ItemDataRole.UserRole)
+KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+#: 「最近打开」最多列几条
+RECENT_MAX = 20
+
+
+def _glyph_icon(glyph: str, color: str) -> QIcon:
+    """把图标字形画成 QIcon：树节点只收 QIcon，QSS 管不到节点图标的颜色。"""
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setFont(icon_font(22))
+    painter.setPen(QColor(color))
+    painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), glyph)
+    painter.end()
+    return QIcon(pixmap)
 
 
 class DocsPage(QWidget):
@@ -31,6 +51,9 @@ class DocsPage(QWidget):
         self._current: Optional[Path] = None
         self._pdf_doc = None
         self._shortcuts: List[QShortcut] = []
+        self._loaded: set = set()      # 子节点已经填好的文件夹（懒加载去重）
+        self._expanded: set = set()    # 用户正展开着的文件夹（刷新列表后还原）
+        self._built = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 14, 20, 16)
@@ -100,14 +123,40 @@ class DocsPage(QWidget):
         list_card = Card(radius=14, fill=theme.CARD, border=theme.BORDER, padding=10,
                          spacing=6)
         self.list_card = list_card
-        list_title = QLabel("最近打开 / 下载目录")
+        list_title = QLabel("目录")
         list_title.setObjectName("Small")
         list_card.body.addWidget(list_title)
         self.dir_label = QLabel("")
         self.dir_label.setObjectName("Tiny")
         list_card.body.addWidget(self.dir_label)
-        self.scroll, _body, self.list_layout = make_scroll()
-        list_card.body.addWidget(self.scroll, 1)
+
+        # 全部展开 / 全部收起：树一深就得有一键到位的地方（风格同页面其它小按钮）
+        tools_row = QHBoxLayout()
+        tools_row.setSpacing(6)
+        self.expand_button = SoftButton("全部展开", "subtle", height=26, min_width=86,
+                                        point_size=8.2)
+        self.expand_button.setToolTip("把目录树里的文件夹全部展开")
+        self.expand_button.clicked.connect(self.expand_all)
+        tools_row.addWidget(self.expand_button)
+        self.collapse_button = SoftButton("全部收起", "subtle", height=26, min_width=86,
+                                          point_size=8.2)
+        self.collapse_button.setToolTip("把目录树里的文件夹全部收起")
+        self.collapse_button.clicked.connect(self.collapse_all)
+        tools_row.addWidget(self.collapse_button)
+        tools_row.addStretch(1)
+        list_card.body.addLayout(tools_row)
+
+        self.tree = QTreeWidget()
+        self.tree.setObjectName("DocsTree")
+        self.tree.setHeaderHidden(True)
+        self.tree.setIndentation(14)
+        self.tree.setIconSize(QSize(16, 16))
+        self.tree.setAnimated(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.itemExpanded.connect(self._on_expanded)
+        self.tree.itemCollapsed.connect(self._on_collapsed)
+        self.tree.itemDoubleClicked.connect(self._on_double_clicked)
+        list_card.body.addWidget(self.tree, 1)
         list_card.setFixedWidth(268)
         body.addWidget(list_card)
 
@@ -157,7 +206,7 @@ class DocsPage(QWidget):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             return label
 
-    # -------------------------------------------------- 列表
+    # -------------------------------------------------- 目录树
     def _recent(self) -> List[str]:
         raw = self.store.get_setting(RECENT_KEY, "") or ""
         return [item for item in raw.split("|") if item]
@@ -168,66 +217,177 @@ class DocsPage(QWidget):
         self._refresh_list()
 
     def _refresh_list(self) -> None:
-        from .widgets import clear_layout
-
-        clear_layout(self.list_layout)
-        entries: List[Path] = [Path(item) for item in self._recent() if Path(item).exists()]
-        # 下载目录（eLearning 作业文件夹）里的文档也列出来，含课程子文件夹
+        """重建整棵目录树：「最近打开」+ 下载目录（子文件夹展开时才加载）。"""
         from . import settings_dirs
 
+        expanded = set(self._expanded)      # 先拍快照：clear() 时可能触发收起信号
+        self.tree.clear()
+        self._loaded.clear()
         downloads = settings_dirs.downloads_dir(self.store)
         try:
-            if hasattr(self, "dir_label"):
-                self.dir_label.setText(f"{downloads.name or downloads}")
-                self.dir_label.setToolTip(str(downloads))
+            self.dir_label.setText(f"{downloads.name or downloads}")
+            self.dir_label.setToolTip(str(downloads))
         except Exception:
             pass
-        if downloads.exists():
-            found: List[Path] = []
-            try:
-                for path in downloads.rglob("*"):
-                    if not path.is_file():
-                        continue
-                    if path.suffix.lower() not in docs_reader.SUPPORTED:
-                        continue
-                    try:
-                        depth = len(path.relative_to(downloads).parts)
-                    except Exception:
-                        depth = 9
-                    if depth > 4:
-                        continue
-                    found.append(path)
-            except Exception:
-                found = []
-            found.sort(key=lambda item: item.stat().st_mtime, reverse=True)
-            for path in found[:18]:
-                if path not in entries:
-                    entries.append(path)
-        if not entries:
-            empty = QLabel("还没有文档：点右上角「打开文件」，或在作业页下载课件")
-            empty.setObjectName("Tiny")
-            empty.setWordWrap(True)
-            self.list_layout.addWidget(empty)
-        for path in entries[:24]:
-            self.list_layout.addWidget(self._row(path))
-        self.list_layout.addStretch(1)
+        self.tree.addTopLevelItem(self._recent_item())
+        self.tree.addTopLevelItem(self._downloads_item(downloads))
+        root_item = self.tree.topLevelItem(1)
+        recent_item = self.tree.topLevelItem(0)
+        if recent_item is not None:
+            recent_item.setExpanded(True)
+        if not self._built:
+            # 第一次进来把下载目录展开，和以前「直接看到文件列表」保持一致
+            self._built = True
+            expanded.add(str(downloads))
+            self._expanded.add(str(downloads))
+        if root_item is not None and str(downloads) in expanded:
+            root_item.setExpanded(True)
+        # 还原用户上次展开的文件夹：按层级从浅到深，父节点展开后子节点才存在
+        for value in sorted(expanded, key=lambda text: len(Path(text).parts)):
+            if value == str(downloads):
+                continue
+            item = self._find_item(value)
+            if item is not None:
+                item.setExpanded(True)
 
-    def _row(self, path: Path) -> QWidget:
-        row = QWidget()
-        row.setFixedHeight(38)
-        row.setCursor(Qt.CursorShape.PointingHandCursor)
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(6)
-        label = QLabel(path.stem[:28])
-        label.setStyleSheet(f"color: {theme.TEXT_SOFT}; font-size: 12px;")
-        label.setToolTip(str(path))
-        layout.addWidget(label, 1)
-        suffix = QLabel(path.suffix.lower().lstrip(".").upper())
-        suffix.setObjectName("Tiny")
-        layout.addWidget(suffix)
-        row.mouseReleaseEvent = lambda event, p=path: self.open_path(p)
-        return row
+    def _downloads_item(self, downloads: Path) -> QTreeWidgetItem:
+        """下载目录的根节点：内容懒加载，没有目录就先给一句提示。"""
+        item = self._folder_item(downloads)
+        item.setText(0, downloads.name or str(downloads))
+        if not downloads.is_dir():
+            item.takeChildren()
+            item.addChild(self._hint_item(
+                "还没有文档：点右上角「打开文件」，或在作业页下载课件"))
+        return item
+
+    def _recent_item(self) -> QTreeWidgetItem:
+        """「最近打开」是虚拟分组节点，不占磁盘目录。"""
+        item = QTreeWidgetItem(["最近打开"])
+        item.setIcon(0, _glyph_icon(icons.CLOCK, theme.ACCENT2))
+        item.setData(0, KIND_ROLE, "group")
+        entries = [Path(value) for value in self._recent() if Path(value).exists()]
+        for path in entries[:RECENT_MAX]:
+            item.addChild(self._file_item(path))
+        if not entries:
+            item.addChild(self._hint_item("还没有打开过文档"))
+        return item
+
+    def _folder_item(self, path: Path) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([path.name or str(path)])
+        item.setIcon(0, _glyph_icon(icons.FOLDER, theme.ACCENT))
+        item.setData(0, KIND_ROLE, "folder")
+        item.setData(0, PATH_ROLE, str(path))
+        item.setToolTip(0, str(path))
+        # 占位子节点：让文件夹先显示成「可展开」，真正的内容等展开时再列
+        item.addChild(self._hint_item("展开查看…"))
+        return item
+
+    def _file_item(self, path: Path) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([path.name])
+        item.setIcon(0, _glyph_icon(icons.DOCUMENT, theme.TEXT_SOFT))
+        item.setData(0, KIND_ROLE, "file")
+        item.setData(0, PATH_ROLE, str(path))
+        item.setToolTip(0, str(path))
+        return item
+
+    @staticmethod
+    def _hint_item(text: str) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([text])
+        item.setData(0, KIND_ROLE, "hint")
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        item.setForeground(0, QColor(theme.MUTED))
+        return item
+
+    @staticmethod
+    def _item_path(item: Optional[QTreeWidgetItem]) -> Optional[Path]:
+        raw = item.data(0, PATH_ROLE) if item is not None else None
+        return Path(raw) if raw else None
+
+    def _fill_folder(self, item: QTreeWidgetItem, folder: Path) -> None:
+        """把一个文件夹的直接子项填进节点：文件夹排在文件前面，深层继续懒加载。"""
+        item.takeChildren()
+        try:
+            entries = sorted(folder.iterdir(),
+                             key=lambda one: (not one.is_dir(), one.name.lower()))
+        except OSError:
+            entries = []
+        added = 0
+        for path in entries:
+            try:
+                if path.name.startswith("."):
+                    continue
+                if path.is_dir():
+                    child = self._folder_item(path)
+                elif path.suffix.lower() in docs_reader.SUPPORTED:
+                    child = self._file_item(path)
+                else:
+                    continue
+            except OSError:
+                continue
+            item.addChild(child)
+            added += 1
+        if not added:
+            item.addChild(self._hint_item("（空文件夹）"))
+
+    def _on_expanded(self, item: QTreeWidgetItem) -> None:
+        path = self._item_path(item)
+        if path is None or item.data(0, KIND_ROLE) != "folder":
+            return
+        key = str(path)
+        self._expanded.add(key)
+        if key in self._loaded:
+            return
+        self._loaded.add(key)
+        self._fill_folder(item, path)
+
+    def _on_collapsed(self, item: QTreeWidgetItem) -> None:
+        path = self._item_path(item)
+        if path is not None:
+            self._expanded.discard(str(path))
+
+    def _on_double_clicked(self, item: QTreeWidgetItem, _column: int = 0) -> None:
+        """双击文件用现有 open_path 打开；双击文件夹就是展开 / 收起。"""
+        kind = item.data(0, KIND_ROLE)
+        if kind == "folder":
+            item.setExpanded(not item.isExpanded())
+            return
+        if kind != "file":
+            return
+        path = self._item_path(item)
+        if path is None:
+            return
+        # 打开文档会刷新整棵树（可能把当前节点删掉），所以等这轮信号走完再开
+        QTimer.singleShot(0, lambda target=path: self.open_path(target))
+
+    def _find_item(self, path: str) -> Optional[QTreeWidgetItem]:
+        stack = [self.tree.topLevelItem(index)
+                 for index in range(self.tree.topLevelItemCount())]
+        while stack:
+            item = stack.pop()
+            if item is None:
+                continue
+            if str(item.data(0, PATH_ROLE) or "") == path:
+                return item
+            stack.extend(item.child(index) for index in range(item.childCount()))
+        return None
+
+    def expand_all(self) -> None:
+        """全部展开：子目录是展开时懒加载的，所以要自己一层层往下走。"""
+        for index in range(self.tree.topLevelItemCount()):
+            self._expand_item(self.tree.topLevelItem(index))
+
+    def _expand_item(self, item: Optional[QTreeWidgetItem]) -> None:
+        if item is None:
+            return
+        if item.data(0, KIND_ROLE) == "folder" and not item.isExpanded():
+            item.setExpanded(True)      # 展开时才把子节点填进来
+        for index in range(item.childCount()):
+            self._expand_item(item.child(index))
+
+    def collapse_all(self) -> None:
+        """全部收起：只留「最近打开」和下载目录两个顶层分组。"""
+        self.tree.collapseAll()
+        self._expanded.clear()
 
     # -------------------------------------------------- 打开
     def open_file(self) -> None:
@@ -299,7 +459,7 @@ class DocsPage(QWidget):
                 pass
 
     def sync_fullscreen_state(self, on: bool) -> None:
-        """进出全屏：收起自己的标题行 / 翻页行 / 左侧列表，把阅读区放到最大。"""
+        """进出全屏：收起自己的标题行 / 翻页行 / 左侧目录树，把阅读区放到最大。"""
         self._fullscreen = bool(on)
         try:
             self.fullscreen_button.setText("退出全屏" if on else "全屏")

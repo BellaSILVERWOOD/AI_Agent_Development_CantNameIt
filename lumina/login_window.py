@@ -1,8 +1,11 @@
-"""登录窗口：本机账户验证 + 「记住这台设备 24 / 48 小时」。
+"""登录窗口：本机账户验证 + 「记住这台设备 24 / 48 小时」+ 服务器账号登录。
 
 * 第一次运行（还没有任何账户）→ 变成「创建本机账户」；
 * 之后每次启动：选账户 + 输密码，本地比对（不联网）；
 * 勾了「记住这台设备」，期内的下次启动直接进入，不再问密码；
+* 忘了密码 / 想用服务器账号：窗口里有「服务器账号登录」入口（用户名或邮箱 +
+  口令 + 服务器地址），失败时会分清「口令错」和「服务器不可达」，后者提示
+  并保留老的「邮件申请注册」入口；
 * 忘记密码：只能清空账户（日程 / 邮件等数据不动），窗口里给了这个紧急出口。
 """
 from __future__ import annotations
@@ -14,7 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from . import account_rescue, accounts, icons, theme, users
+from . import account, account_rescue, accounts, icons, theme, users
 from .config import DATA_DIR, data_dir_source, set_data_dir_pointer
 from .widgets import BaseDialog, ConfirmDialog, IconButton, Select, SoftButton
 
@@ -24,21 +27,27 @@ class LoginWindow(BaseDialog):
 
     def __init__(self, store, parent=None):
         super().__init__(
-            parent, width=460, height=520,
+            parent, width=460, height=560,
             title="登录 DanLume",
-            subtitle="账户与密码只存在这台电脑上，不会上传到任何地方",
+            subtitle="本地账户只存在这台电脑上；也可以登录自家账号服务器",
             icon=icons.LOCK,
         )
         self.store = store
         self.user: Optional[Dict[str, Any]] = None
         self.remember_minutes = 0
         self._show_password = False
+        self._show_server_password = False
+        # 服务器登录走后台线程（网络慢时界面不卡）
+        self._server_call = account.AsyncCall(self)
+        self._server_call.finished.connect(self._on_server_login_finished)
+        self._server_call.failed.connect(self._on_server_login_failed)
 
         self.stack = QStackedWidget()
         self.body.addWidget(self.stack)
         self.stack.addWidget(self._build_login_page())
         self.stack.addWidget(self._build_create_page())
         self.stack.addWidget(self._build_register_page())
+        self.stack.addWidget(self._build_server_page())
 
         self.error = QLabel("")
         self.error.setObjectName("Tiny")
@@ -112,6 +121,14 @@ class LoginWindow(BaseDialog):
 
         links = QHBoxLayout()
         links.setSpacing(10)
+        # 服务器账号登录：放在最前面，是这个版本主要推荐的路
+        self.server_link = SoftButton("服务器账号登录", "subtle", height=26,
+                                      min_width=112, point_size=8.4)
+        self.server_link.setToolTip(
+            "用自家账号服务器上的用户名（或邮箱）+ 口令登录；不联网时用下面"
+            "「邮件申请注册」的老流程")
+        self.server_link.clicked.connect(lambda: self._set_mode(3))
+        links.addWidget(self.server_link)
         self.add_link = SoftButton("新建账户", "ghost", height=26, min_width=80,
                                    point_size=8.4)
         self.add_link.clicked.connect(lambda: self._set_mode(1))
@@ -311,6 +328,223 @@ class LoginWindow(BaseDialog):
         layout.addStretch(1)
         self._approved_payload: Optional[Dict[str, Any]] = None
         return page
+
+    # -------------------------------------------------- 服务器账号登录页
+    def _build_server_page(self) -> QWidget:
+        """「服务器账号登录」：用户名/邮箱 + 口令 + 服务器地址 + 注册入口。"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        hint = QLabel(
+            "用自家账号服务器上的账户登录。服务器不可达时，可以退回下面的"
+            "「邮件申请注册」（老的注册方式，不需要这台机器联外网）。")
+        hint.setObjectName("Tiny")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        url_label = QLabel("服务器地址")
+        url_label.setObjectName("Small")
+        layout.addWidget(url_label)
+        self.server_url_edit = QLineEdit()
+        self.server_url_edit.setMinimumHeight(34)
+        self.server_url_edit.setPlaceholderText(account.DEFAULT_SERVER_URL)
+        try:
+            self.server_url_edit.setText(account.server_url(self.store))
+        except Exception:
+            self.server_url_edit.setText(account.DEFAULT_SERVER_URL)
+        layout.addWidget(self.server_url_edit)
+
+        account_label = QLabel("用户名或邮箱")
+        account_label.setObjectName("Small")
+        layout.addWidget(account_label)
+        self.server_account_edit = QLineEdit()
+        self.server_account_edit.setMinimumHeight(34)
+        self.server_account_edit.setPlaceholderText("服务器上的用户名，或者注册用的邮箱")
+        self.server_account_edit.returnPressed.connect(self._server_login)
+        layout.addWidget(self.server_account_edit)
+
+        password_label = QLabel("口令")
+        password_label.setObjectName("Small")
+        layout.addWidget(password_label)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.server_password_edit = QLineEdit()
+        self.server_password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.server_password_edit.setMinimumHeight(34)
+        self.server_password_edit.setPlaceholderText("服务器账号的口令")
+        self.server_password_edit.returnPressed.connect(self._server_login)
+        row.addWidget(self.server_password_edit, 1)
+        self.server_eye_button = IconButton(icons.EYE, size=34, glyph_size=13,
+                                            tip="显示 / 隐藏口令")
+        self.server_eye_button.clicked.connect(self._toggle_server_eye)
+        row.addWidget(self.server_eye_button)
+        layout.addLayout(row)
+
+        self.server_login_button = SoftButton("登录服务器账号", "primary", height=38,
+                                              min_width=150, point_size=9.2)
+        self.server_login_button.clicked.connect(self._server_login)
+        layout.addWidget(self.server_login_button)
+
+        self.server_status = QLabel("")
+        self.server_status.setObjectName("Tiny")
+        self.server_status.setWordWrap(True)
+        layout.addWidget(self.server_status)
+
+        links = QHBoxLayout()
+        links.setSpacing(10)
+        self.server_register_button = SoftButton("注册服务器账号…", "ghost", height=26,
+                                                 min_width=126, point_size=8.4)
+        self.server_register_button.setToolTip("在服务器上注册一个新账户，成功后直接登录")
+        self.server_register_button.clicked.connect(self._open_server_register)
+        links.addWidget(self.server_register_button)
+        # 服务器连不上时的退路：老的「邮件申请注册」
+        self.server_mail_link = SoftButton("邮件申请注册（旧的注册方式）", "ghost",
+                                           height=26, min_width=176, point_size=8.4)
+        self.server_mail_link.setToolTip(
+            "客户端 RSA 信封 → 邮件给管理员 → 管理员签发；不需要服务器能连上")
+        self.server_mail_link.clicked.connect(lambda: self._set_mode(2))
+        links.addWidget(self.server_mail_link)
+        links.addStretch(1)
+        layout.addLayout(links)
+
+        back_row = QHBoxLayout()
+        back_row.setSpacing(8)
+        server_back = SoftButton("返回登录", "ghost", height=26, min_width=80,
+                                 point_size=8.4)
+        server_back.clicked.connect(lambda: self._set_mode(0))
+        back_row.addWidget(server_back)
+        back_row.addStretch(1)
+        layout.addLayout(back_row)
+        layout.addStretch(1)
+        return page
+
+    def _toggle_server_eye(self) -> None:
+        self._show_server_password = not self._show_server_password
+        self.server_password_edit.setEchoMode(
+            QLineEdit.EchoMode.Normal if self._show_server_password
+            else QLineEdit.EchoMode.Password)
+        self.server_eye_button.setToolTip(
+            "隐藏口令" if self._show_server_password else "显示口令")
+
+    def _server_note(self, message: str, kind: str = "danger") -> None:
+        """服务器登录页的状态行（不走全局 error，免得和本机登录的提示混在一起）。"""
+        color = {"danger": theme.DANGER, "warning": theme.WARNING,
+                 "success": theme.SUCCESS, "muted": theme.MUTED}.get(kind, theme.MUTED)
+        self.server_status.setStyleSheet(f"color: {color};")
+        self.server_status.setText(message)
+
+    def _server_login(self) -> None:
+        """服务器账号登录：后台线程跑，回来再判断是口令错还是服务器不可达。"""
+        if self._server_call.is_busy():
+            return
+        base = self.server_url_edit.text().strip()
+        name = self.server_account_edit.text().strip()
+        password = self.server_password_edit.text()
+        if not name:
+            self._server_note("先填服务器上的用户名或邮箱", "warning")
+            return
+        if not password:
+            self._server_note("请输入口令", "warning")
+            return
+        try:
+            account.set_server_url(self.store, base)
+        except Exception:
+            pass
+        self.server_login_button.setEnabled(False)
+        self._server_note("正在连接服务器…", "muted")
+        started = self._server_call.run(account.login, name, password, self.store)
+        if not started:
+            self.server_login_button.setEnabled(True)
+
+    def _on_server_login_finished(self, result: Any) -> None:
+        self.server_login_button.setEnabled(True)
+        if not isinstance(result, dict):
+            self._server_note("服务器返回了看不懂的东西，请稍后再试", "danger")
+            return
+        if result.get("ok"):
+            self.server_status.setText("")
+            self._server_enter(result)
+            return
+        code = str(result.get("code") or "")
+        if result.get("offline") or code in ("offline", "tls_error"):
+            self._server_note(
+                "%s\n服务器连不上时可以点下面「邮件申请注册（旧的注册方式）」，"
+                "不需要这台机器能连服务器。" % (result.get("error") or "服务器不可达"),
+                "warning")
+            return
+        if code == "invalid_credentials":
+            self._server_note("账号或口令不对（检查一下大小写、是不是邮箱登录）", "danger")
+            self.server_password_edit.selectAll()
+            return
+        if code == "device_limit" or int(result.get("status") or 0) == 409:
+            used = result.get("devices_used")
+            limit = result.get("device_limit")
+            names = []
+            for item in result.get("devices") or []:
+                if isinstance(item, dict):
+                    names.append(str(item.get("name") or item.get("id") or ""))
+            extra = ("：" + "、".join([n for n in names if n][:4])) if any(names) else ""
+            self._server_note(
+                "登录设备数超过上限（%s/%s）%s\n先在别的设备上退出登录，"
+                "或者进应用后在设置页「服务器账户 → 设备管理」里踢掉一台。"
+                % (used, limit, extra), "danger")
+            return
+        if code == "banned" or code == "disabled":
+            self._server_note(str(result.get("error") or "账号已被停用"), "danger")
+            return
+        self._server_note(str(result.get("error") or "登录失败"), "danger")
+
+    def _on_server_login_failed(self, message: str) -> None:
+        self.server_login_button.setEnabled(True)
+        self._server_note("登录失败：%s" % message, "danger")
+
+    def _server_enter(self, result: Dict[str, Any]) -> None:
+        """服务器登录 / 注册成功：本机补一条账户记录，然后照常进主界面。"""
+        account_info = result.get("account")
+        if not isinstance(account_info, dict):
+            account_info = {}
+        username = str(account_info.get("username") or "").strip() \
+            or self.server_account_edit.text().strip()
+        email = str(account_info.get("email") or "").strip()
+        user_id = account.ensure_local_user(self.store, username, email)
+        if not user_id:
+            self._server_note(
+                "服务器登录成功，但这台电脑上写不进本机账户（数据目录可能只读）：%s"
+                % DATA_DIR, "danger")
+            return
+        minutes = users.remember_minutes(self.store)
+        self._enter(int(user_id), int(minutes), first_time=False)
+        if self.user is not None:
+            # 主界面会用它显示「服务器账号」
+            try:
+                self.user["server_account"] = True
+            except Exception:
+                pass
+
+    def _open_server_register(self) -> None:
+        from .server_ui import ServerRegisterDialog
+
+        if self._server_call.is_busy():
+            return
+        try:
+            account.set_server_url(self.store, self.server_url_edit.text().strip())
+        except Exception:
+            pass
+        dialog = ServerRegisterDialog(self.store, self)
+        if dialog.exec() != ServerRegisterDialog.DialogCode.Accepted:
+            return
+        payload = dialog.payload
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            return
+        account_info = payload.get("account") or {}
+        if isinstance(account_info, dict):
+            if account_info.get("username"):
+                self.server_account_edit.setText(str(account_info["username"]))
+            self.server_password_edit.clear()
+        self._server_note("注册成功，正在登录…", "success")
+        self._server_enter(payload)
 
     def _send_request(self) -> None:
         from . import registration
@@ -646,9 +880,14 @@ class LoginWindow(BaseDialog):
             pass
 
     def _set_mode(self, index: int) -> None:
-        self.stack.setCurrentIndex(2 if index == 2 else (1 if index else 0))
+        index = max(0, min(3, int(index)))
+        self.stack.setCurrentIndex(index)
         self.error.setText("")
-        if index == 2:
+        if index == 3:
+            # 服务器登录页：状态行是自己的，进来先清空
+            self._server_note("", "muted")
+            self.server_account_edit.setFocus()
+        elif index == 2:
             self.reg_name.setFocus()
         elif index:
             self.new_name.setFocus()
@@ -677,6 +916,8 @@ class LoginWindow(BaseDialog):
             self._create()
         elif index == 2:
             self._register()
+        elif index == 3:
+            self._server_login()
         else:
             self._login()
 

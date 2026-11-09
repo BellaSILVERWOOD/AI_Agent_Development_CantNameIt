@@ -386,6 +386,14 @@ class SettingsPage(QWidget):
         self._tester = SmtpTester(self)
         self._tester.finished.connect(self._on_test_finished)
         self._contacts: List[Dict[str, Any]] = []
+        # 服务器账户卡：网络请求都走后台线程（测连接 / 拉设备列表）
+        from . import account as account_module
+
+        self._server_call = account_module.AsyncCall(self)
+        self._server_call.finished.connect(self._on_server_call_finished)
+        self._server_call.failed.connect(self._on_server_call_failed)
+        self._server_mode = ""
+        self._server_stream_state = ""
 
         state = theme.appearance()
         self._accent = state.accent
@@ -436,7 +444,8 @@ class SettingsPage(QWidget):
         self._sections = [
             {"key": "general", "title": "常规", "glyph": icons.SUN,
              "subtitle": "外观、账户、提醒与界面交互",
-             "cards": ["appearance", "tray", "account", "reminder", "focus", "uis"]},
+             "cards": ["appearance", "tray", "account", "server", "reminder",
+                       "focus", "uis"]},
             {"key": "dashboard", "title": "仪表板", "glyph": icons.INFO,
              "subtitle": "校车方向与 ehall 各服务的数据来源",
              "cards": ["dashsrc"]},
@@ -523,6 +532,7 @@ class SettingsPage(QWidget):
             "appearance": self._build_appearance_card(),
             "dashsrc": self._build_dashsrc_card(),
             "account": self._build_account_card(),
+            "server": self._build_server_card(),
             "smtp": self._build_smtp_card(),
             "imap": self._build_imap_card(),
             "uis": self._build_uis_card(),
@@ -1005,6 +1015,303 @@ class SettingsPage(QWidget):
         dialog = AdminDialog(self.store, self.window())
         dialog.exec()
         self._refresh_account_card()
+
+    # -------------------------------------------------- 服务器账户
+    def _build_server_card(self) -> Card:
+        from . import account as account_module
+
+        card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=12)
+        card.body.addLayout(self._section_head(
+            icons.INFO, "服务器账户",
+            "自家账号服务器（默认 %s）：登录状态、设备管理与公告通道"
+            % account_module.DEFAULT_SERVER_URL,
+        ))
+
+        url_row = HScrollRow(height=38, spacing=8)
+        self.server_url_edit = QLineEdit()
+        self.server_url_edit.setPlaceholderText(account_module.DEFAULT_SERVER_URL)
+        self.server_url_edit.setMinimumWidth(260)
+        self.server_url_edit.setFixedHeight(34)
+        self.server_url_edit.setToolTip("账号服务器地址（例如 https://43.108.99.38.sslip.io）")
+        self.server_url_edit.editingFinished.connect(self._save_server_url)
+        url_row.addWidget(self.server_url_edit)
+        self.server_test_button = SoftButton("测试连接", "ghost", height=32,
+                                             min_width=104, point_size=8.6)
+        self.server_test_button.setToolTip("GET /api/v1/health：看服务器在不在线、版本和延迟")
+        self.server_test_button.clicked.connect(self._test_server_connection)
+        url_row.addWidget(self.server_test_button)
+        self.server_save_button = SoftButton("保存地址", "ghost", height=32,
+                                             min_width=96, point_size=8.6)
+        self.server_save_button.clicked.connect(self._save_server_url)
+        url_row.addWidget(self.server_save_button)
+        card.body.addWidget(url_row)
+
+        self.server_status_label = QLabel("还没测过连接")
+        self.server_status_label.setObjectName("Tiny")
+        self.server_status_label.setWordWrap(True)
+        card.body.addWidget(self.server_status_label)
+
+        self.server_account_label = QLabel("服务器账号：未登录")
+        self.server_account_label.setStyleSheet(
+            f"color: {TEXT}; font-size: 10pt; font-weight: 600;")
+        card.body.addWidget(self.server_account_label)
+        self.server_detail_label = QLabel("")
+        self.server_detail_label.setObjectName("Tiny")
+        self.server_detail_label.setWordWrap(True)
+        card.body.addWidget(self.server_detail_label)
+
+        button_row = HScrollRow(height=38, spacing=8)
+        self.server_devices_button = SoftButton("设备管理…", "ghost", height=32,
+                                                min_width=104, point_size=8.6)
+        self.server_devices_button.setToolTip("列出这台账号登录过的设备，可以把某一台踢下线")
+        self.server_devices_button.clicked.connect(self._open_server_devices)
+        button_row.addWidget(self.server_devices_button)
+        self.server_refresh_button = SoftButton("刷新状态", "ghost", height=32,
+                                                min_width=96, point_size=8.6,
+                                                glyph=icons.REFRESH)
+        self.server_refresh_button.setToolTip("重新向服务器要一次设备列表（也会更新设备数）")
+        self.server_refresh_button.clicked.connect(self._refresh_server_devices)
+        button_row.addWidget(self.server_refresh_button)
+        self.server_logout_button = SoftButton("退出登录", "danger", height=32,
+                                               min_width=96, point_size=8.6)
+        self.server_logout_button.setToolTip("清掉这台电脑上保存的服务器令牌（服务器上的账号不动）")
+        self.server_logout_button.clicked.connect(self._server_logout)
+        button_row.addWidget(self.server_logout_button)
+        card.body.addWidget(button_row)
+
+        self.server_stream_label = QLabel("公告通道：未连接")
+        self.server_stream_label.setObjectName("Tiny")
+        self.server_stream_label.setWordWrap(True)
+        card.body.addWidget(self.server_stream_label)
+
+        self.server_note_label = QLabel("")
+        self.server_note_label.setObjectName("Tiny")
+        self.server_note_label.setWordWrap(True)
+        card.body.addWidget(self.server_note_label)
+        return card
+
+    def refresh_server_card(self) -> None:
+        """回填服务器账户卡（登录状态 / 设备数 / 地址）。"""
+        from . import account as account_module
+
+        if not hasattr(self, "server_url_edit"):
+            return
+        try:
+            url = account_module.server_url(self.store)
+        except Exception:
+            url = account_module.DEFAULT_SERVER_URL
+        if not self.server_url_edit.text().strip():
+            self.server_url_edit.setText(url)
+        session = {}
+        try:
+            session = account_module.session(self.store)
+        except Exception:
+            session = {}
+        logged_in = bool(session.get("logged_in"))
+        if logged_in:
+            used = session.get("devices_used") or 0
+            limit = session.get("device_limit") or 0
+            self.server_account_label.setText(
+                "服务器账号：%s（已登录）" % (session.get("username") or "—"))
+            self.server_detail_label.setText(
+                "设备数 %s/%s · 令牌到期 %s"
+                % (used, limit if limit else "?", session.get("expires_at") or "未记录"))
+            if session.get("insecure"):
+                self.server_note_label.setStyleSheet(f"color: {WARNING};")
+                self.server_note_label.setText(
+                    "提示：服务器证书与地址不匹配（sslip.io 的通配证书），"
+                    "已降级为不校验证书；口令走加密连接传输，但仍建议让管理员换成"
+                    "匹配域名的证书。")
+            else:
+                self.server_note_label.setText("")
+        else:
+            self.server_account_label.setText("服务器账号：未登录")
+            self.server_detail_label.setText(
+                "在登录窗口点「服务器账号登录」即可；没登录时服务器公告不会推送。")
+            self.server_note_label.setText("")
+        for widget in (getattr(self, "server_devices_button", None),
+                       getattr(self, "server_refresh_button", None),
+                       getattr(self, "server_logout_button", None)):
+            try:
+                widget.setEnabled(logged_in)
+            except Exception:
+                pass
+        self._refresh_server_stream_label(session.get("logged_in"))
+
+    def set_server_stream_state(self, state: str) -> None:
+        """主窗口的公告通道状态变化时更新这行小字。"""
+        self._server_stream_state = str(state or "")
+        try:
+            self._refresh_server_stream_label(None)
+        except Exception:
+            pass
+
+    def _refresh_server_stream_label(self, logged_in) -> None:
+        label = getattr(self, "server_stream_label", None)
+        if label is None:
+            return
+        if logged_in is None:
+            try:
+                from . import account as account_module
+
+                logged_in = bool(account_module.session(self.store).get("logged_in"))
+            except Exception:
+                logged_in = False
+        state = self._server_stream_state
+        if not logged_in:
+            label.setText("公告通道：未连接（没登录服务器账号）")
+            return
+        text = {
+            "ws": "公告通道：WebSocket 实时连接中",
+            "connecting": "公告通道：正在连接 WebSocket…",
+            "poll": "公告通道：轮询模式（每 20 秒一次）",
+            "offline": "公告通道：离线，正在按 1s → 60s 退避重连…",
+            "unsupported": "公告通道：这个服务器版本还没有 /announcements 接口",
+            "off": "公告通道：已断开",
+        }.get(state, "公告通道：连接中…")
+        label.setText(text)
+
+    def _save_server_url(self) -> None:
+        from . import account as account_module
+
+        try:
+            value = account_module.set_server_url(self.store, self.server_url_edit.text())
+        except Exception as exc:  # noqa: BLE001
+            self.server_status_label.setStyleSheet(f"color: {DANGER};")
+            self.server_status_label.setText("地址存不下来：%s" % exc)
+            return
+        self.server_url_edit.setText(value)
+        self.server_status_label.setStyleSheet(f"color: {MUTED};")
+        self.server_status_label.setText("服务器地址已保存：%s" % value)
+
+    def _test_server_connection(self) -> None:
+        from . import account as account_module
+
+        if self._server_call.is_busy():
+            return
+        url = self.server_url_edit.text().strip()
+        try:
+            account_module.set_server_url(self.store, url)
+        except Exception:
+            pass
+        self.server_test_button.setEnabled(False)
+        self.server_status_label.setStyleSheet(f"color: {MUTED};")
+        self.server_status_label.setText("正在测试连接…")
+        self._server_mode = "health"
+        if not self._server_call.run(account_module.health, url, self.store):
+            self.server_test_button.setEnabled(True)
+
+    def _on_server_call_finished(self, result) -> None:
+        mode = self._server_mode
+        self._server_mode = ""
+        if mode == "health":
+            self.server_test_button.setEnabled(True)
+            ok = False
+            info: Dict[str, Any] = {}
+            if isinstance(result, tuple) and len(result) == 2:
+                ok, info = bool(result[0]), (result[1] or {})
+            elif isinstance(result, dict):
+                ok = bool(result.get("ok"))
+                info = result
+            if ok:
+                bits = ["在线"]
+                if info.get("version"):
+                    bits.append("版本 %s" % info["version"])
+                if info.get("latency_ms") is not None:
+                    bits.append("延迟 %s ms" % info["latency_ms"])
+                try:
+                    uptime = int(info.get("uptime_seconds") or 0)
+                except (TypeError, ValueError):
+                    uptime = 0
+                if uptime:
+                    bits.append("已运行 %d 分钟" % (uptime // 60))
+                message = " · ".join(bits)
+                if info.get("insecure"):
+                    message += "（证书未校验）"
+                self.server_status_label.setStyleSheet(f"color: {SUCCESS};")
+                self.server_status_label.setText(message)
+            else:
+                reason = str(info.get("error") or "服务器不可达")
+                tone = WARNING if info.get("offline") else DANGER
+                self.server_status_label.setStyleSheet(f"color: {tone};")
+                self.server_status_label.setText("离线 · %s" % reason)
+            return
+        if mode == "devices":
+            self.server_refresh_button.setEnabled(True)
+            if isinstance(result, dict) and result.get("ok"):
+                devices = result.get("devices")
+                if not isinstance(devices, list):
+                    payload = result.get("data") or {}
+                    devices = payload.get("devices") if isinstance(
+                        payload.get("devices"), list) else []
+                try:
+                    self.store.set_setting(
+                        "server_devices_used",
+                        str(result.get("devices_used") or len(devices)))
+                except Exception:
+                    pass
+                self.server_status_label.setStyleSheet(f"color: {SUCCESS};")
+                self.server_status_label.setText(
+                    "设备列表已刷新：%d 台" % len(devices))
+                self.refresh_server_card()
+            else:
+                message = str((result or {}).get("error") or "拿不到设备列表")
+                self.server_status_label.setStyleSheet(f"color: {DANGER};")
+                self.server_status_label.setText(message)
+
+    def _on_server_call_failed(self, message: str) -> None:
+        self.server_test_button.setEnabled(True)
+        self.server_refresh_button.setEnabled(True)
+        self.server_status_label.setStyleSheet(f"color: {DANGER};")
+        self.server_status_label.setText("出错了：%s" % message)
+
+    def _refresh_server_devices(self) -> None:
+        from . import account as account_module
+
+        if self._server_call.is_busy():
+            return
+        self.server_refresh_button.setEnabled(False)
+        self.server_status_label.setStyleSheet(f"color: {MUTED};")
+        self.server_status_label.setText("正在向服务器要设备列表…")
+        self._server_mode = "devices"
+        if not self._server_call.run(account_module.devices, self.store):
+            self.server_refresh_button.setEnabled(True)
+
+    def _open_server_devices(self) -> None:
+        from .server_ui import ServerDevicesDialog
+
+        dialog = ServerDevicesDialog(self.store, self.window())
+        dialog.exec()
+        self.refresh_server_card()
+
+    def _server_logout(self) -> None:
+        """退出服务器账号：停公告连接 + 清本机令牌（不动服务器上的账号）。"""
+        from . import account as account_module
+        from .widgets import ConfirmDialog
+
+        dialog = ConfirmDialog(
+            self, title="退出服务器账号？",
+            message="这台电脑上保存的服务器令牌会被清掉，公告也会立刻断开；\n"
+                    "服务器上的账号和别的设备不受影响。",
+            confirm_text="退出登录", danger=True)
+        if dialog.exec() != ConfirmDialog.DialogCode.Accepted:
+            return
+        window = self.window()
+        stop = getattr(window, "stop_server_stream", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+        result = account_module.logout(self.store)
+        self._server_stream_state = "off"
+        if result.get("ok"):
+            self.server_status_label.setStyleSheet(f"color: {MUTED};")
+            self.server_status_label.setText("已退出登录服务器账号")
+        else:
+            self.server_status_label.setStyleSheet(f"color: {DANGER};")
+            self.server_status_label.setText(str(result.get("error") or "退出失败"))
+        self.refresh_server_card()
 
     # -------------------------------------------------- 外观
     def _build_appearance_card(self) -> Card:
@@ -5078,6 +5385,10 @@ class SettingsPage(QWidget):
         self._refresh_contacts()
         self._refresh_timetable_ui()
         self._refresh_groups()
+        try:
+            self.refresh_server_card()
+        except Exception:
+            pass
 
     # -------------------------------------------------- 发件邮箱账户
     def _refresh_account_select(self) -> None:

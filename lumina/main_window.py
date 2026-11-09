@@ -40,6 +40,8 @@ from .mascot import Mascot
 from .focus import AwayToast, FocusMonitor, FocusStartMenu, FocusTimer
 from .llm_local import LocalModelRunner
 from .notices import NoticeWatcher, make_notice_toast
+from .server_feed import ServerAnnouncementWatcher
+from .server_ui import ServerBanner
 from .reminders import ReminderCenter
 from .theme import (
     ACCENT, ACCENT2, BORDER, CARD, DANGER, FAINT, MUTED, SIDEBAR_BG, SUCCESS,
@@ -500,6 +502,13 @@ class MainWindow(QWidget):
         shell_layout.setSpacing(0)
         self.title_bar = TitleBar(self)
         shell_layout.addWidget(self.title_bar)
+        # 服务器公告横幅：塞在标题栏下面、内容区上面；平时藏着，有公告才出现
+        self.server_banner = ServerBanner(self.shell)
+        try:
+            self.server_banner.opened.connect(lambda: self.navigate(2))
+        except Exception:
+            pass
+        shell_layout.addWidget(self.server_banner)
 
         content = QWidget()
         content_layout = QHBoxLayout(content)
@@ -719,6 +728,16 @@ class MainWindow(QWidget):
         self.notice_watcher = NoticeWatcher(store, self)
         self.notice_watcher.new_notices.connect(self._on_new_notices)
         self.notice_watcher.start()
+
+        # 服务器公告（WebSocket 优先，连不上就 20 秒轮询）：只有登录了服务器账号才连
+        self.server_watcher = None
+        try:
+            self.server_watcher = ServerAnnouncementWatcher(store, self)
+            self.server_watcher.new_announcements.connect(self._on_server_announcements)
+            self.server_watcher.state_changed.connect(self._on_server_stream_state)
+            self.server_watcher.start()
+        except Exception:
+            self.server_watcher = None
 
         # 使用情况上报（不走邮件）；管理员这份程序顺便起一个小监听
         self._usage_started = time.time()
@@ -2134,6 +2153,44 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    # -------------------------------------------------- 服务器公告
+    def _on_server_announcements(self, items: list) -> None:
+        """收到服务器公告：顶部横幅 + 「通知」页分区 + 设置页状态。"""
+        if not items:
+            return
+        latest = items[-1] if isinstance(items[-1], dict) else None
+        if latest is None:
+            return
+        try:
+            self.server_banner.show_announcement(latest, 5000)
+        except Exception:
+            pass
+        try:
+            self.notices_page.reload()
+        except Exception:
+            pass
+        try:
+            self.settings_page.refresh_server_card()
+        except Exception:
+            pass
+
+    def _on_server_stream_state(self, state: str) -> None:
+        """连接状态变化：只更新设置页那行小字，不打扰用户。"""
+        try:
+            self.settings_page.set_server_stream_state(str(state))
+        except Exception:
+            pass
+
+    def stop_server_stream(self) -> None:
+        """退出服务器账号 / 关窗口时调用：公告连接立刻停。"""
+        watcher = getattr(self, "server_watcher", None)
+        if watcher is None:
+            return
+        try:
+            watcher.stop()
+        except Exception:
+            pass
+
     # -------------------------------------------------- 欢迎语
     def _welcome(self) -> None:
         if self._closed or not self.isVisible():
@@ -2416,6 +2473,11 @@ class MainWindow(QWidget):
             pass
         try:
             self.notice_watcher.stop()
+        except Exception:
+            pass
+        # 服务器公告的连接也要断开（WebSocket 不断会一直挂着）
+        try:
+            self.stop_server_stream()
         except Exception:
             pass
         for toast in list(getattr(self, "_notice_toasts", [])):

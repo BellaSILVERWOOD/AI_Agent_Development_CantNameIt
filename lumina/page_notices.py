@@ -1,4 +1,8 @@
-"""通知页：所有通知（不含日程），可按来源多选筛选、只看未读、搜索。"""
+"""通知页：所有通知（不含日程），可按来源多选筛选、只看未读、搜索。
+
+「服务器公告」单独一个分区：那是自家账号服务器推下来的，和教务抓取不是一回事
+（存在 `server_announcements` 表，实时通道见 `server_feed.py`）。
+"""
 from __future__ import annotations
 
 from typing import Any, Dict, List
@@ -11,8 +15,11 @@ from PySide6.QtWidgets import (
 )
 
 from . import icons, notices, theme
+from .server_ui import level_label, level_tone
 from .utils import open_external
-from .widgets import Card, Pill, SoftButton, ToggleSwitch, make_scroll
+from .widgets import (
+    Card, IconBadge, Pill, SoftButton, ToggleSwitch, make_scroll,
+)
 from .widgets_filter import MultiSelectFilter
 
 
@@ -23,6 +30,52 @@ CATEGORY_COLORS = {
     "图书馆": "teal",
     "其他": "rose",
 }
+
+
+class ServerAnnouncementRow(QWidget):
+    """一条服务器公告（info 浅、warning/critical 醒目）。"""
+
+    def __init__(self, item: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self.item = item
+        level = str(item.get("level") or "info").strip().lower()
+        tone = level_tone(level)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setSpacing(10)
+
+        layout.addWidget(IconBadge(icons.BELL, size=28, color=tone, bg_alpha=0.15,
+                                   radius=9, glyph_size=12), 0,
+                         Qt.AlignmentFlag.AlignTop)
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        title = QLabel(str(item.get("title") or "服务器公告"))
+        title.setWordWrap(True)
+        font = QFont(self.font())
+        font.setPointSizeF(10.0)
+        font.setWeight(QFont.Weight.DemiBold if not item.get("read_at")
+                       else QFont.Weight.Normal)
+        title.setFont(font)
+        title.setStyleSheet(f"color: {theme.TEXT};")
+        title_row.addWidget(title, 1)
+        if item.get("pinned"):
+            title_row.addWidget(Pill("置顶", tone, theme.soft(tone, 0.16),
+                                     point_size=7.6))
+        title_row.addWidget(Pill(level_label(level), tone, theme.soft(tone, 0.16),
+                                 point_size=7.6))
+        text_box.addLayout(title_row)
+        body = QLabel(str(item.get("body") or "").strip())
+        body.setObjectName("Small")
+        body.setWordWrap(True)
+        body.setVisible(bool(str(item.get("body") or "").strip()))
+        text_box.addWidget(body)
+        stamp = str(item.get("created_at") or item.get("received_at") or "")[:16]
+        meta = QLabel("服务器公告" + ((" · " + stamp.replace("T", " ")) if stamp else ""))
+        meta.setObjectName("Tiny")
+        text_box.addWidget(meta)
+        layout.addLayout(text_box, 1)
 
 
 class NoticeRow(QWidget):
@@ -149,9 +202,7 @@ class NoticesPage(QWidget):
         # ---------------- 列表
         self.scroll, _body, self.list_layout = make_scroll()
         root.addWidget(self.scroll, 1)
-        self.empty_label = QLabel("还没有通知，点右上角「立即抓取」试试")
-        self.empty_label.setObjectName("Muted")
-        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._server_rows: List[ServerAnnouncementRow] = []
 
         self.reload()
 
@@ -182,6 +233,12 @@ class NoticesPage(QWidget):
 
         clear_layout(self.list_layout)
         self._rows = []
+        self._server_rows = []
+        # 服务器公告单独一个分区，永远排在最上面（不参与下面的筛选）
+        self._render_server_section()
+        self._render_section_title(
+            "教务通知", "从教务处 / 新闻文化网抓取的条目",
+            self.store.unread_notice_count())
         rows = self.store.list_notices(300)
 
         sources = set(self.source_filter.selected())
@@ -206,21 +263,79 @@ class NoticesPage(QWidget):
             self._rows.append(row)
             shown += 1
         if shown == 0:
-            self.list_layout.addWidget(self.empty_label)
-            self.empty_label.show()
+            empty = QLabel("还没有通知，点右上角「立即抓取」试试")
+            empty.setObjectName("Muted")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.list_layout.addWidget(empty)
         self.list_layout.addStretch(1)
         self._update_counts(len(rows))
+
+    # -------------------------------------------------- 服务器公告分区
+    def _server_items(self) -> List[Dict[str, Any]]:
+        try:
+            return self.store.list_server_announcements(60)
+        except Exception:
+            return []
+
+    def _render_section_title(self, title: str, hint: str, unread=None) -> None:
+        """分区小标题（服务器公告 / 教务通知）。"""
+        box = QWidget()
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 6, 0, 2)
+        layout.setSpacing(8)
+        label = QLabel(title)
+        label.setObjectName("H3")
+        layout.addWidget(label)
+        if unread:
+            layout.addWidget(Pill("未读 %d" % int(unread), theme.ACCENT,
+                                  theme.soft(theme.ACCENT, 0.14), point_size=7.8))
+        tip = QLabel(hint)
+        tip.setObjectName("Tiny")
+        layout.addWidget(tip)
+        layout.addStretch(1)
+        self.list_layout.addWidget(box)
+
+    def _render_server_section(self) -> None:
+        items = self._server_items()
+        unread = 0
+        try:
+            unread = self.store.unread_server_announcement_count()
+        except Exception:
+            unread = 0
+        self._render_section_title(
+            "服务器公告",
+            "账号服务器推送的公告（实时通道；断线自动重连）",
+            unread)
+        if not items:
+            empty = QLabel("还没有服务器公告。登录服务器账号后，管理员发的公告会出现在这里。")
+            empty.setObjectName("Muted")
+            empty.setWordWrap(True)
+            self.list_layout.addWidget(empty)
+            return
+        for item in items:
+            row = ServerAnnouncementRow(item)
+            self.list_layout.addWidget(row)
+            self._server_rows.append(row)
 
     def _update_counts(self, total: int) -> None:
         unread = self.store.unread_notice_count()
         self.unread_pill.set_text(f"未读 {unread}")
         last = self.store.get_setting("notice_last_run", "") or "还没有抓取过"
+        try:
+            server_count = len(self._server_items())
+        except Exception:
+            server_count = 0
         self.subtitle.setText(
-            f"共 {total} 条通知 · 未读 {unread} 条 · 上次抓取 {last}（日程不在此列）")
+            f"共 {total} 条通知 · 未读 {unread} 条 · 服务器公告 {server_count} 条"
+            f" · 上次抓取 {last}（日程不在此列）")
 
     # -------------------------------------------------- 操作
     def _mark_all_read(self) -> None:
         self.store.mark_notices_read()
+        try:
+            self.store.mark_server_announcements_read()
+        except Exception:
+            pass
         self.reload()
 
     def refresh_now(self) -> None:

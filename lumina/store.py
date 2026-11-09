@@ -203,6 +203,19 @@ CREATE TABLE IF NOT EXISTS notices (
     read_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_notices_url ON notices(url);
+CREATE TABLE IF NOT EXISTS server_announcements (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    level TEXT NOT NULL DEFAULT 'info',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    received_at TEXT NOT NULL,
+    read_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_server_ann_received
+    ON server_announcements(received_at);
 CREATE TABLE IF NOT EXISTS event_groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -403,6 +416,74 @@ CREATE TABLE IF NOT EXISTS important_dates (
         self.conn.execute(
             "UPDATE notices SET read_at = ? WHERE read_at IS NULL", (now_str(),)
         )
+        self.conn.commit()
+
+    # ---------------------------------------------------------- 服务器公告
+    # 服务器（自家账号服务器）推下来的公告单独一张表：id 就是服务器上的公告 id，
+    # 用它去重、也用来记「已经收到哪儿了」（settings.last_announcement_id）。
+    def add_server_announcement(self, item: Dict[str, Any]) -> bool:
+        """存一条服务器公告；这条之前没有（= 新公告）返回 True。"""
+        if not isinstance(item, dict):
+            return False
+        try:
+            ann_id = int(item.get("id") or 0)
+        except (TypeError, ValueError):
+            return False
+        if ann_id <= 0:
+            return False
+        title = str(item.get("title") or "").strip()
+        body = str(item.get("body") or "")
+        level = str(item.get("level") or "info").strip().lower() or "info"
+        if level not in ("info", "warning", "critical"):
+            level = "info"
+        pinned = 1 if item.get("pinned") else 0
+        created_at = str(item.get("created_at") or "")
+        expires_at = str(item.get("expires_at") or "")
+        existing = self.conn.execute(
+            "SELECT id FROM server_announcements WHERE id = ?", (ann_id,)).fetchone()
+        if existing:
+            # 服务器上可能改过内容：更新文字，但保留本地的已读状态
+            self.conn.execute(
+                "UPDATE server_announcements SET title = ?, body = ?, level = ?,"
+                " pinned = ?, created_at = ?, expires_at = ? WHERE id = ?",
+                (title, body, level, pinned, created_at, expires_at, ann_id))
+            self.conn.commit()
+            return False
+        self.conn.execute(
+            "INSERT INTO server_announcements(id, title, body, level, pinned,"
+            " created_at, expires_at, received_at) VALUES (?,?,?,?,?,?,?,?)",
+            (ann_id, title, body, level, pinned, created_at, expires_at, now_str()))
+        self.conn.commit()
+        return True
+
+    def list_server_announcements(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """服务器公告：置顶的在前，然后按服务器 id 从新到旧。"""
+        rows = self.conn.execute(
+            "SELECT * FROM server_announcements"
+            " ORDER BY pinned DESC, id DESC LIMIT ?", (int(limit),)).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["pinned"] = bool(item.get("pinned"))
+            items.append(item)
+        return items
+
+    def unread_server_announcement_count(self) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM server_announcements WHERE read_at IS NULL"
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def mark_server_announcements_read(self) -> None:
+        self.conn.execute(
+            "UPDATE server_announcements SET read_at = ? WHERE read_at IS NULL",
+            (now_str(),))
+        self.conn.commit()
+
+    def mark_server_announcement_read(self, ann_id: int) -> None:
+        self.conn.execute(
+            "UPDATE server_announcements SET read_at = ? WHERE id = ? AND read_at IS NULL",
+            (now_str(), int(ann_id)))
         self.conn.commit()
 
     def get_setting(self, key: str, default: str = "") -> str:

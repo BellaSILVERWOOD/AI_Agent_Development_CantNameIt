@@ -125,6 +125,13 @@ def main() -> int:
         pass
 
     store = Store(DB_PATH)
+    # 服务器账号客户端：把数据层绑上去（令牌 / 服务器地址 / 公告游标都从这里读写）
+    try:
+        from lumina import account as account_module
+
+        account_module.bind(store)
+    except Exception:
+        pass
     # 多套 API 配置：老的「单套」设置第一次运行会变成第 1 套，之后在面板/设置里随时切换
     try:
         from lumina import llm_profiles

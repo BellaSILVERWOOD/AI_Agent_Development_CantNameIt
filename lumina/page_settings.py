@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QProcess, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QIntValidator, QLinearGradient, QPainter, QPen,
 )
@@ -29,8 +30,8 @@ from .theme import (
 )
 from .inputs import ColorDots
 from .widgets import (
-    Card, FieldBlock, GlassSlider, HScrollRow, IconBadge, IconButton, NavButton,
-    Select, SoftButton, ToggleSwitch, clear_layout, rounded_path,
+    BaseDialog, Card, FieldBlock, GlassSlider, HScrollRow, IconBadge, IconButton,
+    NavButton, Select, SoftButton, ToggleSwitch, clear_layout, rounded_path,
 )
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -375,6 +376,65 @@ class ContactRow(QWidget):
         painter.drawPath(rounded_path(rect, 10))
 
 
+def _friendly_time(value: str) -> str:
+    """把 manifest / 报告里的 UTC 时间（2026-11-09T13:40:00Z）写成好读的样子。"""
+    text = str(value or "").strip()
+    if not text:
+        return "时间未知"
+    if text.endswith("Z"):
+        return text[:-1].replace("T", " ") + " UTC"
+    return text.replace("T", " ")
+
+
+def _record_total(tables) -> int:
+    """各表行数加起来（提示里显示「共 N 条记录」）。"""
+    if not isinstance(tables, dict):
+        return 0
+    total = 0
+    for value in tables.values():
+        try:
+            total += int(value)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+class _MessageDialog(BaseDialog):
+    """数据迁移用的一小段提示：一段话 + 一个（或两个）按钮。
+
+    比 ConfirmDialog 多一点：「立即重启」这类主操作 + 「稍后」这类次操作，
+    执行完 exec() 看返回值就知道用户点了主按钮没有。
+    """
+
+    def __init__(self, parent, title: str, message: str,
+                 glyph: str = icons.CHECK, tone: str = SUCCESS,
+                 primary_text: str = "知道了", secondary_text: str = ""):
+        # 高度按文字大概算一下：导入完成的提示里有一整串备份路径，固定高度会被切掉
+        rows = 0
+        for line in str(message).splitlines() or [""]:
+            rows += max(1, (len(line) // 40) + 1)
+        height = max(190, min(470, 120 + rows * 19))
+        super().__init__(parent, width=490, height=height, title=title, icon=glyph,
+                         icon_color=tone)
+        label = QLabel(message)
+        label.setWordWrap(True)
+        label.setObjectName("Muted")
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.body.addWidget(label)
+        self.body.addStretch(1)
+        buttons = []
+        if secondary_text:
+            self.secondary_button = SoftButton(secondary_text, "ghost", height=36,
+                                               min_width=110)
+            self.secondary_button.clicked.connect(self.reject)
+            buttons.append(self.secondary_button)
+        self.primary_button = SoftButton(primary_text, "primary", height=36,
+                                         min_width=108)
+        self.primary_button.clicked.connect(self.accept)
+        buttons.append(self.primary_button)
+        self.add_footer([], buttons)
+
+
 class SettingsPage(QWidget):
     settings_saved = Signal()
     appearance_changed = Signal()
@@ -460,7 +520,7 @@ class SettingsPage(QWidget):
              "cards": ["llm", "prompts"]},
             {"key": "misc", "title": "其他", "glyph": icons.FOLDER,
              "subtitle": "网络代理、文献与本地数据",
-             "cards": ["vpn", "refs", "data"]},
+             "cards": ["vpn", "refs", "backup", "data"]},
         ]
         self._current_section = "general"
 
@@ -549,6 +609,7 @@ class SettingsPage(QWidget):
             "vpn": self._build_vpn_card(),
             "refs": self._build_refs_card(),
             "tray": self._build_tray_card(),
+            "backup": self._build_backup_card(),
             "data": self._build_data_card(),
         }
         for widget in self._card_widgets.values():
@@ -5194,6 +5255,223 @@ class SettingsPage(QWidget):
         self.location_status.setText(text)
         self.location_status.setStyleSheet(f"color: {SUCCESS};")
 
+    # -------------------------------------------------- 数据迁移（导出 / 导入 .dlpk）
+    def _build_backup_card(self) -> Card:
+        """设置页里的「数据迁移」卡：导出数据包 / 从数据包导入。"""
+        card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=12)
+        card.body.addLayout(self._section_head(
+            icons.SWAP, "数据迁移",
+            "导出成 .dlpk 数据包：换电脑、重装系统、或在 Python 版与 Rust 版之间搬数据",
+        ))
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.backup_export_button = SoftButton(
+            "导出数据包…", "ghost", glyph=icons.DOWNLOAD, height=34,
+            min_width=126, point_size=9.0)
+        self.backup_export_button.setToolTip(
+            "把当前数据打成一个 .dlpk 文件（本质是 zip）\n"
+            "里面是 manifest.json + lumina.db + README.txt；密钥（DPAPI 密文）会被删掉"
+        )
+        self.backup_export_button.clicked.connect(self._export_backup)
+        row.addWidget(self.backup_export_button)
+
+        self.backup_import_button = SoftButton(
+            "从数据包导入…", "ghost", glyph=icons.UPLOAD, height=34,
+            min_width=136, point_size=9.0)
+        self.backup_import_button.setToolTip(
+            "选一个 .dlpk 数据包；导入前会自动备份当前数据库，重启 DanLume 之后才生效"
+        )
+        self.backup_import_button.clicked.connect(self._import_backup)
+        row.addWidget(self.backup_import_button)
+
+        self.backup_restart_button = SoftButton(
+            "立即重启", "subtle", glyph=icons.REFRESH, height=34,
+            min_width=96, point_size=9.0)
+        self.backup_restart_button.setToolTip("重启后把已经解好的数据包换进来")
+        self.backup_restart_button.clicked.connect(self._restart_app)
+        self.backup_restart_button.setVisible(False)
+        row.addWidget(self.backup_restart_button)
+        row.addStretch(1)
+        card.body.addLayout(row)
+
+        self.backup_status = QLabel("")
+        self.backup_status.setObjectName("Tiny")
+        self.backup_status.setWordWrap(True)
+        self.backup_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        card.body.addWidget(self.backup_status)
+
+        hint = QLabel(
+            "数据包里不含任何密钥：邮件口令、AI Key、教务口令、服务器登录都要重新填写。"
+            "导入前会自动把当前数据库备份到 data/backups/，导入要重启后生效。"
+        )
+        hint.setObjectName("Tiny")
+        hint.setWordWrap(True)
+        card.body.addWidget(hint)
+
+        self._refresh_backup_status()
+        return card
+
+    def _set_backup_status(self, text: str, color: str = MUTED) -> None:
+        if not hasattr(self, "backup_status"):
+            return
+        self.backup_status.setText(text)
+        self.backup_status.setStyleSheet(f"color: {color};")
+
+    def _refresh_backup_status(self) -> None:
+        """卡片底部那行状态：有没有等着重启的导入 / 上次导入的结果。"""
+        if not hasattr(self, "backup_status"):
+            return
+        from . import backup as backup_module
+
+        pending = backup_module.pending_import_path(DATA_DIR)
+        restart_button = getattr(self, "backup_restart_button", None)
+        if restart_button is not None:
+            restart_button.setVisible(pending is not None)
+        if pending is not None:
+            self._set_backup_status(
+                "数据包已经解好，重启 DanLume 之后生效（重启之前原来的数据一直都在）。",
+                WARNING)
+            return
+        report = backup_module.import_report(DATA_DIR) or {}
+        if report.get("ok") and report.get("applied_at"):
+            text = "上次导入：%s 已生效，共 %d 条记录" % (
+                _friendly_time(report.get("applied_at")),
+                _record_total(report.get("tables")),
+            )
+            if report.get("backup"):
+                text += "；导入前的旧库备份在 %s" % report.get("backup")
+            self._set_backup_status(text, SUCCESS)
+            return
+        self._set_backup_status(
+            "数据包是 zip：manifest.json（元信息）+ lumina.db（数据库快照）+ "
+            "README.txt（中文说明）。", MUTED)
+
+    def _export_backup(self) -> None:
+        """导出数据包：选保存位置 → export_package → 提示路径与大小。"""
+        from . import backup as backup_module
+
+        default_name = "DanLume-backup-%s.dlpk" % date.today().strftime("%Y%m%d")
+        start = str(DATA_DIR / default_name)
+        path, _selected = QFileDialog.getSaveFileName(
+            self, "导出数据包", start, "DanLume 数据包 (*.dlpk);;所有文件 (*.*)")
+        if not path:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = backup_module.export_package(self.store, Path(path))
+        except Exception as exc:                     # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not result.get("ok"):
+            message = str(result.get("error") or "未知错误")
+            self._set_backup_status("导出失败：%s" % message, DANGER)
+            _MessageDialog(self, "导出失败", message, glyph=icons.WARNING,
+                           tone=DANGER).exec()
+            return
+        size_bytes = int(result.get("size") or 0)
+        size_text = backup_module.format_size(size_bytes)
+        size_mb = "%.2f MB" % (size_bytes / (1024.0 * 1024.0))
+        total = _record_total(result.get("tables"))
+        target = str(result.get("path") or "")
+        self._set_backup_status("已导出到 %s（%s）" % (target, size_text), SUCCESS)
+        self.notify.emit("数据包已导出（%s）" % size_text)
+        message = "已导出到：\n%s\n\n大小 %s（%s） · 共 %d 条记录" % (
+            target, size_mb, size_text, total)
+        warnings = [str(item) for item in (result.get("warnings") or [])]
+        if warnings:
+            message += "\n\n提醒：\n· " + "\n· ".join(warnings)
+        _MessageDialog(self, "数据包已导出", message, glyph=icons.CHECK,
+                       tone=SUCCESS).exec()
+
+    def _import_backup(self) -> None:
+        """从数据包导入：确认 → import_package（先备份）→ 提醒重启。"""
+        from . import backup as backup_module
+        from .widgets import ConfirmDialog
+
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "选择数据包", str(DATA_DIR), "DanLume 数据包 (*.dlpk);;所有文件 (*.*)")
+        if not path:
+            return
+        pkg = Path(path)
+        try:
+            size_text = backup_module.format_size(pkg.stat().st_size)
+        except OSError:
+            size_text = "大小未知"
+        confirm = ConfirmDialog(
+            self, title="从数据包导入？",
+            message=("会用数据包里的内容覆盖当前的日程、邮件、设置等数据。\n\n"
+                     "导入前会自动备份当前数据库（data/backups/），导入要重启 DanLume "
+                     "之后才生效。密钥不在数据包里：邮件口令、AI Key、教务口令、"
+                     "服务器登录都需要重新填写。\n\n"
+                     "数据包：%s（%s）" % (pkg.name, size_text)),
+            confirm_text="导入", danger=True)
+        if confirm.exec() != ConfirmDialog.DialogCode.Accepted:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = backup_module.import_package(self.store, pkg)
+        except Exception as exc:                     # noqa: BLE001
+            result = {"ok": False, "error": str(exc)}
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not result.get("ok"):
+            message = str(result.get("error") or "未知错误")
+            self._set_backup_status("导入失败：%s" % message, DANGER)
+            _MessageDialog(self, "导入没有完成", message, glyph=icons.WARNING,
+                           tone=DANGER).exec()
+            return
+        total = _record_total(result.get("tables"))
+        backup_path = str(result.get("backup") or "")
+        message = (
+            "数据包已经解好，共 %d 条记录，重启 DanLume 后生效。\n\n"
+            "导入前已经自动备份当前数据：\n%s\n\n"
+            "重启之前原来的数据一直都在；重启之后旧库也仍然保留在上面这个备份里。\n\n"
+            "密钥不在数据包里，重启后需要重新填写：邮件（SMTP）口令、AI Key、"
+            "教务（UIS）口令，并重新登录服务器账号；原来是管理员的话，"
+            "管理员签名私钥也要重新导入。"
+            % (total, backup_path or "（备份路径未知）")
+        )
+        warnings = [str(item) for item in (result.get("warnings") or [])]
+        if warnings:
+            message += "\n\n提醒：\n· " + "\n· ".join(warnings)
+        self._set_backup_status(
+            "数据包已就位，重启后生效；旧库备份：%s" % (backup_path or "未知"), SUCCESS)
+        dialog = _MessageDialog(self, "导入完成，需要重启", message, glyph=icons.CHECK,
+                                tone=SUCCESS, primary_text="立即重启",
+                                secondary_text="稍后自己重启")
+        if dialog.exec() == _MessageDialog.DialogCode.Accepted:
+            self._restart_app()
+            return
+        self._refresh_backup_status()
+
+    def _restart_app(self) -> bool:
+        """重启自己：先起一个新进程，再硬退出当前进程（不等导出完成）。
+
+        Rust 版和 Python 版的冒烟测试都不点这个按钮，所以这里只求「点下去能换成
+        新进程」，优雅退出交给 hard_exit。
+        """
+        from .main_window import hard_exit
+
+        program = sys.executable
+        if getattr(sys, "frozen", False):
+            args = list(sys.argv[1:])
+        else:
+            args = [str(Path(sys.argv[0]).resolve())] + list(sys.argv[1:])
+        try:
+            outcome = QProcess.startDetached(program, args)
+        except Exception:                            # noqa: BLE001
+            outcome = False
+        # PySide6 的不同版本这里可能返回 bool，也可能返回 (bool, pid)
+        started = bool(outcome[0]) if isinstance(outcome, tuple) else bool(outcome)
+        if not started:
+            self._set_backup_status("自动重启失败，请手动关掉 DanLume 再重新打开。", WARNING)
+            return False
+        hard_exit(self.store, 0)
+        return True
+
     def _build_data_card(self) -> Card:
         card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=12)
         card.body.addLayout(self._section_head(
@@ -5385,6 +5663,10 @@ class SettingsPage(QWidget):
         self._refresh_contacts()
         self._refresh_timetable_ui()
         self._refresh_groups()
+        try:
+            self._refresh_backup_status()
+        except Exception:
+            pass
         try:
             self.refresh_server_card()
         except Exception:

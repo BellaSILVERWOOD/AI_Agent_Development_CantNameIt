@@ -8,8 +8,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QRectF, QRegularExpression, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor, QFont, QPainter, QPen, QRegularExpressionValidator,
+)
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget,
 )
@@ -26,6 +28,9 @@ LEVEL_TONES = {
     "critical": lambda: theme.DANGER,
 }
 LEVEL_LABELS = {"info": "公告", "warning": "重要", "critical": "紧急"}
+
+# 「获取验证码」按下后按钮至少按住这么久（服务器一般回 cooldown=60）
+CODE_WAIT_SECONDS = 60
 
 
 def level_tone(level: str) -> str:
@@ -175,30 +180,50 @@ class ServerBanner(QWidget):
 
 # ====================================================================== 注册
 class ServerRegisterDialog(BaseDialog):
-    """注册服务器账号（用户名 / 邮箱 / 口令 / 邀请码）。
+    """注册服务器账号（用户名 / 邮箱 / 邮箱验证码 / 口令 / 邀请码）。
+
+    验证码由「获取验证码」按钮现要（`POST /register/request-code`），6 位数字，
+    发到上面填的邮箱；按钮按下后按服务器给的 `cooldown` 倒计时，期间不能再点。
+    网络请求全走 `account.AsyncCall`（后台线程），界面不会被卡住；服务器回来的
+    错误就地显示在 `status` 这一行里，不弹 QMessageBox。
 
     成功时 `self.payload` 是 `account.register` 的结果，调用方拿它直接登录。
     """
 
     def __init__(self, store, parent=None):
         super().__init__(
-            parent, width=430, height=420,
+            parent, width=430, height=540,
             title="注册服务器账号",
-            subtitle="用户名、邮箱和口令会发到账号服务器；成功后会直接登录",
+            subtitle="用户名、邮箱和口令会发到账号服务器；验证码发到邮箱，"
+                     "注册成功后直接登录",
             icon=icons.CONTACT,
         )
         self.store = store
         self.payload: Optional[Dict[str, Any]] = None
+        self._code_wait = 0                 # 「获取验证码」还剩几秒才能再点
         self._call = account.AsyncCall(self)
         self._call.finished.connect(self._on_finished)
         self._call.failed.connect(self._on_failed)
+        self._code_call = account.AsyncCall(self)
+        self._code_call.finished.connect(self._on_code_finished)
+        self._code_call.failed.connect(self._on_code_failed)
+        self._code_timer = QTimer(self)
+        self._code_timer.setInterval(1000)
+        self._code_timer.timeout.connect(self._tick_code_countdown)
+        self.body.setSpacing(9)
 
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("用户名（服务器上唯一）")
         self.name_edit.setMinimumHeight(36)
         self.email_edit = QLineEdit()
-        self.email_edit.setPlaceholderText("邮箱（找回密码 / 管理员联系用）")
+        self.email_edit.setPlaceholderText("邮箱（验证码发到这里，找回口令也用它）")
         self.email_edit.setMinimumHeight(36)
+        self.code_edit = QLineEdit()
+        self.code_edit.setPlaceholderText("6 位数字（点右边「获取验证码」）")
+        self.code_edit.setMinimumHeight(36)
+        self.code_edit.setMaxLength(6)
+        self.code_edit.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r"^[0-9]{0,6}$"), self))
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.password_edit.setPlaceholderText("口令（建议 8 位以上）")
@@ -207,13 +232,28 @@ class ServerRegisterDialog(BaseDialog):
         self.invite_edit.setPlaceholderText("邀请码（服务器开放注册时才需要，可空）")
         self.invite_edit.setMinimumHeight(36)
 
-        for label, widget in (("用户名", self.name_edit), ("邮箱", self.email_edit),
-                              ("口令", self.password_edit),
-                              ("邀请码", self.invite_edit)):
-            caption = QLabel(label)
-            caption.setObjectName("Small")
-            self.body.addWidget(caption)
-            self.body.addWidget(widget)
+        self._add_caption("用户名")
+        self.body.addWidget(self.name_edit)
+
+        self._add_caption("邮箱")
+        email_row = QHBoxLayout()
+        email_row.setSpacing(8)
+        email_row.addWidget(self.email_edit, 1)
+        self.send_code_button = SoftButton(
+            "获取验证码", "ghost", height=36, min_width=116, point_size=8.8)
+        self.send_code_button.setToolTip("点一下，6 位验证码会发到这个邮箱，10 分钟内有效")
+        self.send_code_button.clicked.connect(self.request_code)
+        email_row.addWidget(self.send_code_button)
+        self.body.addLayout(email_row)
+
+        self._add_caption("邮箱验证码")
+        self.body.addWidget(self.code_edit)
+
+        self._add_caption("口令")
+        self.body.addWidget(self.password_edit)
+
+        self._add_caption("邀请码")
+        self.body.addWidget(self.invite_edit)
 
         self.status = QLabel("")
         self.status.setObjectName("Tiny")
@@ -227,9 +267,114 @@ class ServerRegisterDialog(BaseDialog):
                                           min_width=118)
         self.register_button.clicked.connect(self.submit)
         self.add_footer([], [self.cancel_button, self.register_button])
-        self.email_edit.returnPressed.connect(self.submit)
+        self.email_edit.returnPressed.connect(self.request_code)
+        self.code_edit.returnPressed.connect(self.submit)
         self.password_edit.returnPressed.connect(self.submit)
         self.invite_edit.returnPressed.connect(self.submit)
+
+    def _add_caption(self, text: str) -> None:
+        caption = QLabel(text)
+        caption.setObjectName("Small")
+        self.body.addWidget(caption)
+
+    # -------------------------------------------------- 获取验证码
+    def request_code(self) -> None:
+        """「获取验证码」：先本地校验邮箱，再后台发请求（不阻塞界面）。"""
+        if self._code_call.is_busy():
+            return
+        if self._code_wait > 0:
+            # 冷却里再点（或在邮箱框里按回车）就别真发了，服务器反正会 429
+            self._set_status("验证码刚发过，%d 秒后才能再获取" % self._code_wait,
+                             theme.MUTED)
+            return
+        email = self.email_edit.text().strip()
+        if not email:
+            self._set_status("先填邮箱地址，验证码会发到这个邮箱", theme.WARNING)
+            self.email_edit.setFocus()
+            return
+        if "@" not in email or email.startswith("@") or email.endswith("@"):
+            self._set_status("邮箱要填完整（比如 name@example.com）", theme.WARNING)
+            self.email_edit.setFocus()
+            return
+        self._set_status("正在发送验证码…", theme.MUTED)
+        # 先按住按钮起倒计时（防止连点）；请求失败（服务器没配发信 / 网络不通）再解开
+        self._start_code_countdown(CODE_WAIT_SECONDS)
+        if not self._code_call.run(account.request_email_code, email, self.store):
+            self._stop_code_countdown()
+            self._set_status("上一次请求还没回来，请稍等", theme.WARNING)
+
+    def _start_code_countdown(self, seconds: int) -> None:
+        try:
+            self._code_wait = max(1, int(seconds or CODE_WAIT_SECONDS))
+        except (TypeError, ValueError):
+            self._code_wait = CODE_WAIT_SECONDS
+        self.send_code_button.setText("重新获取(%ds)" % self._code_wait)
+        self.send_code_button.setEnabled(False)
+        self._code_timer.start()
+
+    def _tick_code_countdown(self) -> None:
+        if self._code_wait > 0:
+            self._code_wait -= 1
+        if self._code_wait <= 0:
+            self._stop_code_countdown()
+            return
+        self.send_code_button.setText("重新获取(%ds)" % self._code_wait)
+
+    def _stop_code_countdown(self) -> None:
+        try:
+            self._code_timer.stop()
+        except Exception:
+            pass
+        self._code_wait = 0
+        self.send_code_button.setText("获取验证码")
+        self.send_code_button.setEnabled(True)
+
+    def _on_code_finished(self, result: Any) -> None:
+        if not isinstance(result, dict):
+            self._stop_code_countdown()
+            self._set_status("验证码发不出去：服务器返回了看不懂的东西", theme.DANGER)
+            return
+        if result.get("ok"):
+            try:
+                cooldown = int(result.get("cooldown") or CODE_WAIT_SECONDS)
+            except (TypeError, ValueError):
+                cooldown = CODE_WAIT_SECONDS
+            self._start_code_countdown(max(1, cooldown))
+            self.code_edit.setFocus()
+            email = str(result.get("email") or self.email_edit.text().strip())
+            if result.get("already_registered"):
+                self._set_status(
+                    "这个邮箱已经注册过了：换一个邮箱，或者直接用它在登录页登录"
+                    "（忘记口令就找管理员）", theme.WARNING)
+                return
+            minutes = ""
+            try:
+                expires = int(result.get("expires_in") or 0)
+            except (TypeError, ValueError):
+                expires = 0
+            if expires > 0:
+                minutes = "，%d 分钟内有效" % max(1, expires // 60)
+            self._set_status(
+                "验证码已发到 %s%s，请查收邮件（也看一眼垃圾箱）" % (email, minutes),
+                theme.SUCCESS)
+            return
+        self._stop_code_countdown()
+        message = str(result.get("error") or "验证码发不出去")
+        if result.get("offline"):
+            message = "服务器不可达：%s" % message
+        elif str(result.get("code") or "") in ("email_cooldown", "too_many_requests"):
+            # 服务器说还要等几秒：按钮也跟着按住，别让人白点
+            try:
+                wait = int(result.get("retry_after") or 0)
+            except (TypeError, ValueError):
+                wait = 0
+            if wait > 0:
+                self._start_code_countdown(wait)
+        self._set_status(message, theme.DANGER)
+
+    def _on_code_failed(self, message: str) -> None:
+        self._stop_code_countdown()
+        self._set_status("验证码发不出去：%s" % message, theme.DANGER)
 
     # -------------------------------------------------- 提交
     def submit(self) -> None:
@@ -238,11 +383,22 @@ class ServerRegisterDialog(BaseDialog):
         name = self.name_edit.text().strip()
         email = self.email_edit.text().strip()
         password = self.password_edit.text()
+        code = self.code_edit.text().strip()
         if not name:
             self._set_status("先填一个用户名", theme.WARNING)
             return
-        if "@" not in email:
+        if not email:
+            self._set_status("先填邮箱地址，验证码会发到这个邮箱", theme.WARNING)
+            self.email_edit.setFocus()
+            return
+        if "@" not in email or email.startswith("@") or email.endswith("@"):
             self._set_status("邮箱要填完整（比如 name@example.com）", theme.WARNING)
+            self.email_edit.setFocus()
+            return
+        if len(code) != 6 or not code.isdigit():
+            self._set_status(
+                "邮箱验证码是 6 位数字：先点「获取验证码」，再去邮件里找", theme.WARNING)
+            self.code_edit.setFocus()
             return
         if len(password) < 6:
             self._set_status("口令太短了（至少 6 位）", theme.WARNING)
@@ -250,7 +406,7 @@ class ServerRegisterDialog(BaseDialog):
         self.register_button.setEnabled(False)
         self._set_status("正在注册…", theme.MUTED)
         started = self._call.run(account.register, name, email, password,
-                                 self.invite_edit.text().strip(), self.store)
+                                 self.invite_edit.text().strip(), self.store, code)
         if not started:
             self.register_button.setEnabled(True)
 
@@ -269,14 +425,20 @@ class ServerRegisterDialog(BaseDialog):
             self.accept()
             return
         message = str(result.get("error") or "注册失败")
+        code = str(result.get("code") or "")
         if result.get("offline"):
             message = ("服务器不可达：%s\n可以先用「邮件申请注册」走老的注册流程。"
                        % message)
-        elif str(result.get("code") or "") == "device_limit":
+        elif code == "device_limit":
             used = result.get("devices_used")
             limit = result.get("device_limit")
             message = ("登录设备数超过上限（%s/%s）：先在别的设备上退出，"
                        "或者在设置页「设备管理」里踢掉一台。" % (used, limit))
+        elif code in ("invalid_code", "code_expired"):
+            # 验证码不对 / 过期：把焦点放回验证码框，过期的顺手清掉
+            if code == "code_expired":
+                self.code_edit.clear()
+            self.code_edit.setFocus()
         self._set_status(message, theme.DANGER)
 
     def _on_failed(self, message: str) -> None:

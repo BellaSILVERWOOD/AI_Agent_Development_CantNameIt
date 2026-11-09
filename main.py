@@ -86,6 +86,41 @@ def _configure_text_rendering() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "windows:fontengine=freetype")
 
 
+def _tell_import_done(window) -> None:
+    """上一次启动时刚把数据包换进来：说清楚「数据已恢复、密钥要重填」。
+
+    只在那一次启动里弹一次；之后设置页的「数据迁移」卡片会一直显示最近一次的记录。
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    report = {}
+    try:
+        from lumina import backup as backup_module
+
+        report = backup_module.import_report(DATA_DIR) or {}
+    except Exception:
+        report = {}
+    backup_path = report.get("backup") or ""
+    lines = ["数据已从数据包恢复，导入前的旧数据也已经自动备份。", ""]
+    if backup_path:
+        lines.append("旧库备份：%s" % backup_path)
+    if report.get("source"):
+        lines.append("数据包：%s" % report.get("source"))
+    lines += [
+        "",
+        "为了安全，密钥和登录都不进数据包，需要你重新填写：",
+        "  · 邮件（SMTP）口令、收件箱（IMAP）口令",
+        "  · AI 接口 Key（含多套 API 配置）",
+        "  · 教务（UIS）口令",
+        "  · 服务器账号：重新登录一次",
+        "  · 管理员签名私钥（这台机器原来是管理员的话）",
+    ]
+    try:
+        QMessageBox.information(window, APP_TITLE, "\n".join(lines))
+    except Exception:
+        pass
+
+
 def main() -> int:
     argv = sys.argv[1:]
     # 「诊断入口」：不打开界面，直接把环境 / 数据目录 / 账户 / 设置 / 日志打印出来，
@@ -109,6 +144,19 @@ def main() -> int:
     if smoke:
         # 冒烟测试不去碰 Chromium 配置目录，免得和正在用的实例抢锁
         os.environ.setdefault("LUMINA_SMOKE", "1")
+
+    # 「数据包导入」的收尾工作：上一次在设置页导入的数据包被解成 lumina.db.imported，
+    # 必须在**打开 Store 之前**换进来（带着打开的手柄换不了名字）。见 lumina/backup.py。
+    import_backup = None
+    try:
+        from lumina import backup as backup_module
+
+        import_backup = backup_module.apply_pending_import(DATA_DIR)
+    except Exception:
+        if debug:
+            traceback.print_exc()
+        import_backup = None
+
     _set_app_user_model_id()
     _configure_text_rendering()
     app = QApplication(sys.argv)
@@ -234,6 +282,9 @@ def main() -> int:
     if smoke:
         window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
     window.show()
+    # 启动时刚换过库：提示「数据已恢复，密钥 / 登录要重填」（冒烟测试不弹窗）
+    if import_backup is not None and not smoke:
+        QTimer.singleShot(600, lambda: _tell_import_done(window))
     if smoke:
         QTimer.singleShot(1200, app.quit)
     code = app.exec()

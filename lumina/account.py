@@ -214,7 +214,25 @@ _CODE_TEXT = {
     "not_verified": "邮箱还没验证",
     "server_error": "服务器内部出错",
     "disabled": "账号或设备已被停用",
+    # ---- 邮箱验证码（/register/request-code 与 /register 的 code 字段）
+    "email_cooldown": "验证码刚发过，请稍等一会儿再获取",
+    "too_many_requests": "请求太频繁了，歇一会儿再试",
+    "rate_limited": "请求太频繁了，歇一会儿再试",
+    "email_send_failed": "验证码邮件没发出去（服务器发信服务出了问题）",
+    "email_not_configured": "服务器还没配置发信邮箱，现在发不了验证码（请联系管理员）",
+    "email_code_disabled": "这个服务器现在注册不需要验证码，填好资料直接注册就行",
+    "invalid_email": "邮箱地址不对",
+    "email_domain_not_allowed": "这个邮箱域名不允许注册（换学校邮箱试试）",
+    "invalid_code": "验证码不对",
+    "code_required": "请先获取邮箱验证码",
+    "code_expired": "验证码已过期，请重新获取",
+    "invite_exhausted": "邀请码已经被用完了",
+    "invite_expired": "邀请码已过期",
 }
+
+# 服务器会这几个键给「秒数 / 剩余次数」，界面层要直接读，所以摊平到结果顶层
+NUMBER_KEYS = ("retry_after", "expires_in", "cooldown",
+               "attempts_left", "remaining_attempts")
 
 
 def _server_message(data: Dict[str, Any]) -> str:
@@ -537,6 +555,27 @@ def _from_reply(reply: Dict[str, Any], success: Tuple[int, ...] = (200,)) -> Dic
                    insecure=insecure, data=data, **extras)
 
 
+def _flatten_numbers(result: Dict[str, Any],
+                     data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """把 `retry_after` / `expires_in` / `cooldown` / `attempts_left` 摊平到顶层。
+
+    服务器给的这些值是整数秒 / 次数，界面（倒计时、冷却提示）直接取用，
+    不用每次再去拆 `result["data"]`；解析不出来的就不放，别塞个假 0。
+    """
+    source = data if isinstance(data, dict) else (result.get("data") or {})
+    if not isinstance(source, dict):
+        return result
+    for key in NUMBER_KEYS:
+        value = source.get(key)
+        if value is None:
+            continue
+        try:
+            result[key] = int(float(value))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
 def _secret(store, key: str) -> str:
     target = _resolve(store)
     if target is None:
@@ -678,9 +717,69 @@ def health(base_url: str = "", store=None,
     return ok, info
 
 
+def request_email_code(email: str, store=None) -> Dict[str, Any]:
+    """`POST /register/request-code`：给注册用的邮箱发一封 6 位验证码。
+
+    返回结构跟别的接口一样：`{ok, code, error, status, offline, insecure, data, ...}`，
+    另外把 `retry_after` / `expires_in` / `cooldown` 摊平到顶层（界面的倒计时
+    直接读 `result["cooldown"]` / `result["retry_after"]`）。
+    服务器说这个邮箱已经注册过时会带 `already_registered=True`（此时一般不发码）。
+
+    常见失败：`email_cooldown` / `too_many_requests`（429，带 `retry_after`）、
+    `email_send_failed` / `email_not_configured`（503）、
+    `invalid_email` / `email_domain_not_allowed`（400）。
+    """
+    address = str(email or "").strip()
+    if not address:
+        return _result(code="invalid_email",
+                       error="先填邮箱地址，验证码会发到这个邮箱")
+    reply = _request(store, "POST", API_PREFIX + "/register/request-code",
+                     json_body={"email": address})
+    result = _from_reply(reply, success=(200,))
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    _flatten_numbers(result, data)
+    if data.get("already_registered"):
+        result["already_registered"] = True
+    result["email"] = address
+    # 冷却 / 限流时把「还要等几秒」写进文案里，比让用户猜 retry_after 好
+    code = str(result.get("code") or "")
+    retry_after = result.get("retry_after")
+    if code in ("email_cooldown", "too_many_requests", "rate_limited") and retry_after:
+        if code == "email_cooldown":
+            result["error"] = "验证码刚发过，请 %d 秒后再获取" % int(retry_after)
+        else:
+            result["error"] = "请求太频繁了，请 %d 秒后再试" % int(retry_after)
+    return result
+
+
+def _register_error_text(code: str, data: Dict[str, Any], fallback: str) -> str:
+    """注册失败时给「验证码」这两类错误换成人话（服务器原文常常只有一句英文码）。"""
+    if code == "invalid_code":
+        # 服务端字段名历史上用过两个：attempts_left / remaining_attempts，都认
+        attempts = data.get("attempts_left")
+        if attempts is None:
+            attempts = data.get("remaining_attempts")
+        try:
+            left = int(attempts) if attempts is not None else None
+        except (TypeError, ValueError):
+            left = None
+        if left is not None:
+            if left <= 0:
+                return "验证码不对，试错次数已经用完了，请重新获取验证码"
+            return "验证码不对，还可以再试 %d 次" % left
+        return "验证码不对，请按邮件里最新的那封重填"
+    if code == "code_expired":
+        return "验证码已过期，请重新获取"
+    return fallback
+
+
 def register(username: str, email: str, password: str, invite_code: Optional[str] = None,
-             store=None) -> Dict[str, Any]:
-    """`POST /register`：成功时顺手把会话落盘（= 注册完就是登录状态）。"""
+             store=None, code: Optional[str] = None) -> Dict[str, Any]:
+    """`POST /register`：成功时顺手把会话落盘（= 注册完就是登录状态）。
+
+    `code` 是邮箱验证码（6 位数字，由 `request_email_code` 发出）。传 `None`
+    时请求体里**不带**这个字段，老服务端 / 老调用照旧能跑。
+    """
     body = {
         "username": str(username or "").strip(),
         "email": str(email or "").strip(),
@@ -689,12 +788,20 @@ def register(username: str, email: str, password: str, invite_code: Optional[str
         "device_name": device_name(),
         "platform": platform_tag(),
     }
-    code = str(invite_code or "").strip()
-    if code:
-        body["invite_code"] = code
+    invite = str(invite_code or "").strip()
+    if invite:
+        body["invite_code"] = invite
+    verification = str(code or "").strip()
+    if verification:
+        body["code"] = verification
     reply = _request(store, "POST", API_PREFIX + "/register", json_body=body)
     result = _from_reply(reply, success=(200, 201))
-    if result.get("ok"):
+    if not result.get("ok"):
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        _flatten_numbers(result, data)
+        result["error"] = _register_error_text(
+            str(result.get("code") or ""), data, str(result.get("error") or "注册失败"))
+    else:
         result["session_saved"] = save_session(store, result)
     return result
 

@@ -1,5 +1,7 @@
 # DanLume · 日程与工作汇报
 
+> 三端开发进度与功能矩阵：[PROGRESS.md](PROGRESS.md)（2026-11-10）
+
 <p align="left">
   <img alt="version" src="https://img.shields.io/badge/version-1.0.0-2F7A5F" />
   <img alt="python" src="https://img.shields.io/badge/Python-3.9%2B-2F7A5F" />

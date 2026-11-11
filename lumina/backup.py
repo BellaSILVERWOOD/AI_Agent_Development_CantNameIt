@@ -43,6 +43,10 @@ PACKAGE_SUFFIX = ".dlpk"
 MANIFEST_NAME = "manifest.json"
 DB_NAME = "lumina.db"
 README_NAME = "README.txt"
+# 旧版（本 Python 版）把 AI 记忆存在 data/memory.md 纯文本里；Rust 版存在 memories 表。
+# 包里带上一份 memory.md，换版本时记忆就不会「看不到」。
+MEMORY_NAME = "memory.md"
+MEMORY_PENDING_NAME = "memory.md.imported"     # 解出来、等重启换上的记忆文件
 
 # ---------------------------------------------------------------- 本机路径 / 标记
 LIVE_DB_NAME = "lumina.db"
@@ -86,6 +90,29 @@ def _remove_quietly(path: Path) -> None:
             path.unlink()
     except OSError:
         pass
+
+
+def _write_bytes(path: Path, data: bytes) -> None:
+    with open(str(path), "wb") as handle:
+        handle.write(data)
+
+
+def memory_entries() -> List[str]:
+    """读记忆文件里的「- 」条目（读不到 / 没装记忆模块时返回空表）。"""
+    try:
+        from . import memory
+        return memory.entries()
+    except Exception:                                # noqa: BLE001
+        return []
+
+
+def memory_export_text(entries: List[str]) -> str:
+    """把记忆条目拼成 memory.md（与 memory.py 的 _HEADER 一致，Rust 版认这个格式）。"""
+    header = ("# DanLume 记忆\n\n"
+              "> 这里的内容会随每次 AI 对话带给模型（有长度上限）。\n"
+              "> 想让 AI 做什么/记住什么，直接跟它说「记住：……」即可；也可以手动编辑这个文件。\n")
+    lines = ["- %s\n" % str(item).strip() for item in entries if str(item).strip()]
+    return header + "".join(lines)
 
 
 def _sqlite_backup(source: sqlite3.Connection, dest_path: Path) -> None:
@@ -224,7 +251,8 @@ def export_package(store, out_path: Path) -> Dict[str, Any]:
         if not stripped:
             warnings.append("本机没有保存 DPAPI 加密的密钥，stripped_keys 是空的")
 
-        # 3) manifest + README
+        # 3) manifest + README（+ 记忆文件）
+        remembered = memory_entries()
         manifest: Dict[str, Any] = {
             "format": FORMAT,
             "format_version": FORMAT_VERSION,
@@ -235,19 +263,26 @@ def export_package(store, out_path: Path) -> Dict[str, Any]:
             "tables": tables,
             "secrets_stripped": bool(stripped),
             "stripped_keys": stripped,
+            "memory_included": bool(remembered),
+            "memory_entries": len(remembered),
         }
         try:
             _write_text(workdir / MANIFEST_NAME,
                         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
             _write_text(workdir / README_NAME, _readme_text(manifest, target.name))
+            if remembered:
+                _write_text(workdir / MEMORY_NAME, memory_export_text(remembered))
         except OSError as exc:
             return _fail("写临时文件失败：%s" % exc)
 
         # 4) 打 zip（压缩级别 6）
+        members = [MANIFEST_NAME, DB_NAME, README_NAME]
+        if remembered:
+            members.append(MEMORY_NAME)
         try:
             with zipfile.ZipFile(str(target), "w", zipfile.ZIP_DEFLATED,
                                  compresslevel=6) as archive:
-                for name in (MANIFEST_NAME, DB_NAME, README_NAME):
+                for name in members:
                     archive.write(str(workdir / name), arcname=name)
         except (OSError, zipfile.BadZipFile) as exc:
             return _fail("写 .dlpk 文件失败：%s" % exc)
@@ -263,6 +298,7 @@ def export_package(store, out_path: Path) -> Dict[str, Any]:
             "tables": tables,
             "stripped_keys": stripped,
             "warnings": warnings,
+            "memory_entries": len(remembered),
             "app_version": APP_VERSION,
             "exported_at": manifest["exported_at"],
         }
@@ -277,14 +313,17 @@ def _readme_text(manifest: Dict[str, Any], file_name: str) -> str:
     table_lines = "\n".join("     %-24s %d 行" % (name, count)
                             for name, count in tables.items()) or "     （空）"
     key_lines = "\n".join("     - %s" % key for key in stripped) or "     （没有需要剥离的密钥）"
+    memory_count = int(manifest.get("memory_entries") or 0)
+    memory_line = ("%d 条，导入时一起还原" % memory_count) if memory_count else "本次没有记忆条目"
     return """DanLume 数据包（.dlpk）说明
 ==============================
 
 这是 DanLume 导出的数据包，文件名叫 {file_name}。
-它本质上是一个 zip，里面只有三个东西：
+它本质上是一个 zip，里面有：
 
    manifest.json   元信息：格式、版本、各表行数、被剥离的密钥
    lumina.db       SQLite 数据库快照（一致性快照，不含 -wal / -shm）
+   memory.md       AI 记忆（纯文本，{memory_line}）
    README.txt      本说明（就是你现在看的这份）
 
 --------------------------------------------------------------------------
@@ -356,6 +395,7 @@ Rust 版（DanLume-v2）：设置里同一张「数据迁移」卡片，按钮�
         table_lines=table_lines,
         key_count=len(stripped),
         key_lines=key_lines,
+        memory_line=memory_line,
     )
 
 
@@ -428,6 +468,21 @@ def import_package(store, pkg_path: Path) -> Dict[str, Any]:
             backups_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return _fail("建不了备份目录 %s：%s" % (backups_dir, exc))
+
+        # 3.5) 记忆文件（可选）：Rust 版把 memories 表导成 memory.md 一起放进包里。
+        #      先只读进内存，等库确实就位了再落盘（不留半成品文件）。
+        memory_bytes = b""
+        memory_entries_count = 0
+        if MEMORY_NAME in names:
+            try:
+                memory_bytes = archive.read(MEMORY_NAME)
+            except (KeyError, OSError, zipfile.BadZipFile):
+                memory_bytes = b""
+            if memory_bytes:
+                memory_entries_count = sum(
+                    1 for line in memory_bytes.decode("utf-8", "ignore").splitlines()
+                    if line.strip().startswith(("- ", "* ")))
+
         incoming = data_dir / (PENDING_DB_NAME + ".part")
         _remove_quietly(incoming)
         try:
@@ -504,6 +559,13 @@ def import_package(store, pkg_path: Path) -> Dict[str, Any]:
         except OSError as exc:
             _remove_quietly(incoming)
             return _fail("把包里的库放到 %s 失败：%s" % (imported, exc))
+
+        # 6.5) 记忆文件也放成「等重启」的样子：重启时和库一起换上
+        if memory_bytes:
+            try:
+                _write_bytes(data_dir / MEMORY_PENDING_NAME, memory_bytes)
+            except OSError:
+                memory_entries_count = 0
         try:
             store.set_setting(PENDING_KEY, "1")
             store.set_setting(PENDING_FROM_KEY, str(pkg.resolve()))
@@ -521,6 +583,7 @@ def import_package(store, pkg_path: Path) -> Dict[str, Any]:
             "tables": tables,
             "stripped_keys": [str(key) for key in keys],
             "warnings": warnings,
+            "memory_entries": memory_entries_count,
             "package": str(pkg.resolve()),
             "pending_path": str(imported.resolve()),
             "app": str(manifest.get("app") or ""),
@@ -648,6 +711,23 @@ def apply_pending_import(data_dir: Path) -> Optional[str]:
     except sqlite3.DatabaseError:
         pass
 
+    # 5.5) 记忆文件：包里的 memory.md 换上（旧的那份留成 memory.md.bak，不直接丢）
+    memory_applied = False
+    memory_pending = directory / MEMORY_PENDING_NAME
+    if memory_pending.exists():
+        try:
+            live_memory = directory / MEMORY_NAME
+            if live_memory.exists():
+                try:
+                    os.replace(str(live_memory),
+                               str(live_memory.with_name(MEMORY_NAME + ".bak")))
+                except OSError:
+                    _remove_quietly(live_memory)
+            os.replace(str(memory_pending), str(live_memory))
+            memory_applied = True
+        except OSError:
+            memory_applied = False
+
     pre_import = _newest_pre_import_backup(backups_dir)
     old_backup = pre_import or (str(replaced) if replaced is not None else None)
     _write_report(directory, {
@@ -656,6 +736,7 @@ def apply_pending_import(data_dir: Path) -> Optional[str]:
         "backup": old_backup,
         "tables": tables,
         "source": source_package,
+        "memory_applied": memory_applied,
     })
     return old_backup
 

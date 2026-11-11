@@ -447,6 +447,101 @@ class ServerRegisterDialog(BaseDialog):
 
 
 # ====================================================================== 设备
+class ServerLoginDialog(BaseDialog):
+    """设置页里直接登录服务器账号（不用退出本机登录再重开应用）。"""
+
+    def __init__(self, store, parent=None):
+        super().__init__(
+            parent, width=460, height=330,
+            title="登录 DanLume 账号",
+            subtitle="登录后本机数据不变；账号、设备管理、服务器公告走服务器",
+            icon=icons.LOCK,
+        )
+        self.store = store
+        self.session_payload: Dict[str, Any] = {}
+        self._call = account.AsyncCall(self)
+        self._call.finished.connect(self._on_finished)
+        self._call.failed.connect(self._on_failed)
+
+        self.account_edit = QLineEdit()
+        self.account_edit.setPlaceholderText("用户名或邮箱")
+        self.account_edit.setFixedHeight(34)
+        self.body.addWidget(self.account_edit)
+
+        self.password_edit = QLineEdit()
+        self.password_edit.setPlaceholderText("口令")
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setFixedHeight(34)
+        self.body.addWidget(self.password_edit)
+
+        url_row = QHBoxLayout()
+        url_row.setSpacing(8)
+        self.url_edit = QLineEdit()
+        self.url_edit.setFixedHeight(32)
+        try:
+            self.url_edit.setText(account.server_url(store))
+        except Exception:
+            self.url_edit.setText(account.DEFAULT_SERVER_URL)
+        url_row.addWidget(self.url_edit, 1)
+        self.store_button = SoftButton("保存地址", "ghost", height=32,
+                                       min_width=88, point_size=8.4)
+        self.store_button.clicked.connect(self._save_url)
+        url_row.addWidget(self.store_button)
+        self.body.addLayout(url_row)
+
+        self.status = QLabel("")
+        self.status.setObjectName("Tiny")
+        self.status.setWordWrap(True)
+        self.body.addWidget(self.status)
+
+        self.cancel_button = SoftButton("取消", "ghost", height=36, min_width=88)
+        self.cancel_button.clicked.connect(self.reject)
+        self.login_button = SoftButton("登录", "primary", height=36, min_width=104)
+        self.login_button.clicked.connect(self.submit)
+        self.add_footer([], [self.cancel_button, self.login_button])
+        self.password_edit.returnPressed.connect(self.submit)
+
+    def _save_url(self) -> None:
+        try:
+            account.set_server_url(self.url_edit.text().strip(), self.store)
+            self._set_status("服务器地址已保存", theme.MUTED)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status("保存失败：%s" % exc, theme.DANGER)
+
+    def _set_status(self, text: str, color: str) -> None:
+        self.status.setStyleSheet(f"color: {color};")
+        self.status.setText(text)
+
+    def submit(self) -> None:
+        if self._call.is_busy():
+            return
+        user = self.account_edit.text().strip()
+        password = self.password_edit.text()
+        if not user or not password:
+            self._set_status("用户名和口令都要填", theme.WARNING)
+            return
+        self._save_url()
+        self.login_button.setEnabled(False)
+        self._set_status("正在登录…", theme.MUTED)
+        if not self._call.run(account.login, user, password, self.store):
+            self.login_button.setEnabled(True)
+
+    def _on_finished(self, result: Any) -> None:
+        self.login_button.setEnabled(True)
+        if not isinstance(result, dict):
+            self._set_status("登录失败：返回内容看不懂", theme.DANGER)
+            return
+        if not result.get("ok"):
+            self._set_status(str(result.get("error") or "登录失败"), theme.DANGER)
+            return
+        self.session_payload = result
+        self.accept()
+
+    def _on_failed(self, message: str) -> None:
+        self.login_button.setEnabled(True)
+        self._set_status("登录失败：%s" % message, theme.DANGER)
+
+
 class ServerDevicesDialog(BaseDialog):
     """设备管理：列出登录过的设备，可以把某一台踢下线。"""
 

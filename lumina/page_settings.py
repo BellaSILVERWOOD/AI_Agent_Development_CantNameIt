@@ -1122,6 +1122,16 @@ class SettingsPage(QWidget):
         card.body.addWidget(self.server_detail_label)
 
         button_row = HScrollRow(height=38, spacing=8)
+        self.server_login_button = SoftButton("登录服务器账号…", "primary", height=32,
+                                              min_width=128, point_size=8.6)
+        self.server_login_button.setToolTip("不用退出本机登录，直接登录自家账号服务器")
+        self.server_login_button.clicked.connect(self._open_server_login)
+        button_row.addWidget(self.server_login_button)
+        self.server_register_button = SoftButton("注册…", "ghost", height=32,
+                                                 min_width=88, point_size=8.6)
+        self.server_register_button.setToolTip("用复旦邮箱收验证码注册一个账号")
+        self.server_register_button.clicked.connect(self._open_server_register)
+        button_row.addWidget(self.server_register_button)
         self.server_devices_button = SoftButton("设备管理…", "ghost", height=32,
                                                 min_width=104, point_size=8.6)
         self.server_devices_button.setToolTip("列出这台账号登录过的设备，可以把某一台踢下线")
@@ -1195,6 +1205,12 @@ class SettingsPage(QWidget):
                        getattr(self, "server_logout_button", None)):
             try:
                 widget.setEnabled(logged_in)
+            except Exception:
+                pass
+        for widget in (getattr(self, "server_login_button", None),
+                       getattr(self, "server_register_button", None)):
+            try:
+                widget.setVisible(not logged_in)
             except Exception:
                 pass
         self._refresh_server_stream_label(session.get("logged_in"))
@@ -1344,6 +1360,36 @@ class SettingsPage(QWidget):
         dialog = ServerDevicesDialog(self.store, self.window())
         dialog.exec()
         self.refresh_server_card()
+
+    def _open_server_login(self) -> None:
+        from .server_ui import ServerLoginDialog
+
+        dialog = ServerLoginDialog(self.store, self.window())
+        if dialog.exec() and dialog.session_payload:
+            self.refresh_server_card()
+            self._restart_server_watcher()
+            self.server_status_label.setStyleSheet(f"color: {SUCCESS};")
+            self.server_status_label.setText("已登录服务器账号")
+
+    def _open_server_register(self) -> None:
+        from .server_ui import ServerRegisterDialog
+
+        dialog = ServerRegisterDialog(self.store, self.window())
+        if dialog.exec() and getattr(dialog, "payload", None):
+            self.refresh_server_card()
+            self._restart_server_watcher()
+            self.server_status_label.setStyleSheet(f"color: {SUCCESS};")
+            self.server_status_label.setText("注册成功，已登录服务器账号")
+
+    def _restart_server_watcher(self) -> None:
+        """登录/退出后让公告通道按新令牌重连。"""
+        window = self.window()
+        watcher = getattr(window, "server_watcher", None)
+        try:
+            if watcher is not None:
+                watcher.restart()
+        except Exception:
+            pass
 
     def _server_logout(self) -> None:
         """退出服务器账号：停公告连接 + 清本机令牌（不动服务器上的账号）。"""
@@ -3711,43 +3757,27 @@ class SettingsPage(QWidget):
         card = Card(radius=18, fill=CARD, border=BORDER, padding=20, spacing=14)
         card.body.addLayout(self._section_head(
             icons.EDIT, "提示词",
-            "所有提示词都存在 data/prompts.json 里（不写死在代码）；这里改完点保存就写进文件",
+            "所有提示词都存在 data/prompts.json 里（不写死在代码）；编辑入口统一在 AI 面板的「系统提示词」标签页",
         ))
 
-        pick_row = QHBoxLayout()
-        pick_row.setSpacing(8)
-        pick_label = QLabel("要编辑")
-        pick_label.setObjectName("Small")
-        pick_row.addWidget(pick_label)
-        self.prompt_select = Select()
-        self.prompt_select.setMinimumWidth(240)
-        for key, title in self._prompt_options():
-            self.prompt_select.addItem(title, key)
-        self.prompt_select.currentIndexChanged.connect(self._load_prompt_text)
-        pick_row.addWidget(self.prompt_select)
-        pick_row.addStretch(1)
-        card.body.addLayout(pick_row)
-
-        self.prompt_edit = QPlainTextEdit()
-        self.prompt_edit.setFixedHeight(124)
-        card.body.addWidget(self.prompt_edit)
-
-        prompt_actions = QHBoxLayout()
-        prompt_actions.setSpacing(8)
-        save_prompt = SoftButton("保存提示词", "primary", height=32, min_width=110,
-                                 point_size=8.8)
-        save_prompt.clicked.connect(self._save_prompt_text)
-        prompt_actions.addWidget(save_prompt)
-        reset_prompt = SoftButton("恢复默认", "ghost", height=32, min_width=92,
+        # 这里原来还有一个就地编辑框（下拉 + 文本框 + 保存 / 恢复默认），
+        # 和 AI 面板的「系统提示词」标签页读写的是同一个 data/prompts.json，
+        # 两个入口容易改岔，已合并到那边；这张卡只留跳转与打开文件。
+        edit_row = QHBoxLayout()
+        edit_row.setSpacing(8)
+        edit_hint = QLabel("按场景分类编辑、保存即生效；本卡不再重复一套编辑框。")
+        edit_hint.setObjectName("Tiny")
+        edit_hint.setWordWrap(True)
+        edit_row.addWidget(edit_hint, 1)
+        open_library = SoftButton("去提示词库编辑", "primary", height=32, min_width=132,
                                   point_size=8.8)
-        reset_prompt.clicked.connect(self._reset_prompt_text)
-        prompt_actions.addWidget(reset_prompt)
+        open_library.clicked.connect(self._open_prompt_library)
+        edit_row.addWidget(open_library)
         open_file = SoftButton("打开配置文件", "ghost", height=32, min_width=112,
                                point_size=8.8)
         open_file.clicked.connect(self._open_prompts_file)
-        prompt_actions.addWidget(open_file)
-        prompt_actions.addStretch(1)
-        card.body.addLayout(prompt_actions)
+        edit_row.addWidget(open_file)
+        card.body.addLayout(edit_row)
 
         self.prompt_status = QLabel("")
         self.prompt_status.setObjectName("Tiny")
@@ -3837,7 +3867,6 @@ class SettingsPage(QWidget):
         card.body.addWidget(self.prompt_gen_status)
         self._refresh_prompt_gen_status()
 
-        self._load_prompt_text()
         return card
 
     # -------------------------------------------------- 时间 / IP / 生成程序
@@ -3924,63 +3953,16 @@ class SettingsPage(QWidget):
         else:
             self.prompt_gen_status.setText(f"生成程序：已启用（{path}）")
 
-    @staticmethod
-    def _prompt_options() -> List[tuple]:
-        return [
-            ("system:assistant", "系统提示词 · 通用助手"),
-            ("system:weekly_report", "系统提示词 · 周报"),
-            ("system:homework", "系统提示词 · 作业摘要"),
-            ("system:latex", "系统提示词 · LaTeX"),
-            ("scene:weekly_report", "场景 · 生成周报"),
-            ("scene:homework_summary", "场景 · 作业摘要"),
-        ]
-
-    def _prompt_key(self) -> str:
-        return self.prompt_select.currentData() or "system:assistant"
-
-    def _load_prompt_text(self, _index: int = -1) -> None:
-        from . import prompts
-
-        key = self._prompt_key()
-        data = prompts.load()
-        kind, name = key.split(":", 1)
-        if kind == "system":
-            value = (data.get("system") or {}).get(name, "")
+    def _open_prompt_library(self) -> None:
+        """跳到 AI 面板的「系统提示词」标签页（提示词只在这一个地方编辑）。"""
+        window = self.window()
+        opener = getattr(window, "show_ai_prompts", None)
+        if callable(opener):
+            opener()
+            self.prompt_status.setText("已打开 AI 面板的「系统提示词」标签页")
         else:
-            value = ((data.get("scenes") or {}).get(name) or {}).get("prompt", "")
-        self.prompt_edit.setPlainText(str(value))
-        self.prompt_status.setText(f"当前编辑：{key} · 文件 {prompts.path()}")
-
-    def _save_prompt_text(self) -> None:
-        from . import prompts
-
-        key = self._prompt_key()
-        kind, name = key.split(":", 1)
-        text = self.prompt_edit.toPlainText().strip()
-        if kind == "system":
-            ok = prompts.save({"system": {name: text}})
-        else:
-            data = prompts.load()
-            scenes = dict(data.get("scenes") or {})
-            item = dict(scenes.get(name) or {"title": name, "enabled": True})
-            item["prompt"] = text
-            scenes[name] = item
-            ok = prompts.save({"scenes": scenes})
-        self.prompt_status.setText(
-            f"已保存到 {prompts.path()}" if ok else "保存失败，检查一下文件权限")
-
-    def _reset_prompt_text(self) -> None:
-        from . import prompts
-
-        key = self._prompt_key()
-        kind, name = key.split(":", 1)
-        if kind == "system":
-            self.prompt_edit.setPlainText(
-                (prompts.DEFAULTS.get("system") or {}).get(name, ""))
-        else:
-            item = (prompts.DEFAULTS.get("scenes") or {}).get(name) or {}
-            self.prompt_edit.setPlainText(item.get("prompt", ""))
-        self.prompt_status.setText("已填回默认内容，点「保存提示词」才会生效")
+            self.prompt_status.setText(
+                "找不到 AI 面板入口；也可以点「打开配置文件」直接改 data/prompts.json")
 
     def _open_prompts_file(self) -> None:
         from . import prompts

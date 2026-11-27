@@ -1,5 +1,10 @@
 # DanLume · 日程与工作汇报
 
+> [!WARNING]
+> **本项目（Python / PySide6 版）即将 deprecated（停止维护）。**
+> 后续功能开发与问题修复只会在 Rust 桌面版进行：[DanLume-Accelerated](https://github.com/BellaSILVERWOOD/DanLume-Accelerated)，手机端见 [DanLume-HarmonyOS](https://github.com/BellaSILVERWOOD/DanLume-HarmonyOS)。
+> 这个仓库保留只读参考，不再接收功能更新。
+
 <p align="left">
   <img alt="version" src="https://img.shields.io/badge/version-1.0.0-2F7A5F" />
   <img alt="python" src="https://img.shields.io/badge/Python-3.9%2B-2F7A5F" />
